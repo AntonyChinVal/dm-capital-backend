@@ -1,9 +1,9 @@
 {
-  "name": "qop-terminal-backend",
+  "name": "dm-capital-backend",
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "QOP Terminal backend — Deribit BTC options gateway",
+  "description": "DM Capital backend — Deribit BTC options gateway",
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "build": "tsc",

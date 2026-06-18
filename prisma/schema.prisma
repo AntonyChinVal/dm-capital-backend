@@ -1,4 +1,4 @@
-// QOP Terminal — Persistence schema
+// DM Capital — Persistence schema
 // SQLite (single instance per Hernán Q21.a).
 // Schema designed backtest-ready per Hernán Q18 — captures enough payload
 // to re-evaluate Phase 9 interpretation rules over historical data.

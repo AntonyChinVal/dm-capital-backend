@@ -1,12 +1,17 @@
 # syntax=docker/dockerfile:1.6
 #
-# QOP Terminal backend — single-stage image.
+# DM Capital backend — single-stage image.
 # Runs migrations on container start, then boots the Node service.
 # SQLite database lives under /data (mounted as a Fly volume in production).
 #
-FROM node:20-alpine
+# Use Debian slim (not Alpine): Prisma's query engine needs OpenSSL 3 on glibc.
+# Alpine/musl + OpenSSL is a common source of "Error load..." at migrate deploy.
+FROM node:20-slim
 
-# Pin pnpm via corepack so build script behaviour matches local.
+RUN apt-get update -y \
+  && apt-get install -y --no-install-recommends openssl ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
+
 RUN corepack enable && corepack prepare pnpm@10.6.5 --activate
 
 WORKDIR /app
@@ -28,7 +33,7 @@ RUN mkdir -p /data
 ENV NODE_ENV=production \
     HOST=0.0.0.0 \
     PORT=4000 \
-    DATABASE_URL="file:/data/qop.db"
+    DATABASE_URL="file:/data/dm-capital.db"
 
 EXPOSE 4000
 

@@ -121,9 +121,9 @@ async function refreshSubscriptions(): Promise<void> {
       'trades.option.BTC.100ms',
       'deribit_volatility_index.btc_usd',
     ]);
-    console.log(`[qop-backend] subscribed to ${dws.subscribedCount()} channels (tickers + trades)`);
+    console.log(`[dm-capital-backend] subscribed to ${dws.subscribedCount()} channels (tickers + trades)`);
   } catch (err) {
-    console.error('[qop-backend] refreshSubscriptions failed', err);
+    console.error('[dm-capital-backend] refreshSubscriptions failed', err);
   }
 }
 
@@ -236,7 +236,7 @@ app.get('/api/history/export/flow.csv', async (req: Request, res: Response) => {
 
     const stamp = new Date().toISOString().slice(0, 10);
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-    res.setHeader('Content-Disposition', `attachment; filename="qop-flow-${stamp}.csv"`);
+    res.setHeader('Content-Disposition', `attachment; filename="dm-capital-flow-${stamp}.csv"`);
 
     const header = [
       'ts_iso', 'trade_id', 'expiration', 'strike', 'type', 'side', 'tag',
@@ -804,7 +804,7 @@ app.get('/api/alerts/stream', (req: Request, res: Response) => {
 });
 
 app.listen(PORT, HOST, async () => {
-  console.log(`[qop-backend] listening on http://${HOST}:${PORT}`);
+  console.log(`[dm-capital-backend] listening on http://${HOST}:${PORT}`);
   try {
     await dws.connect();
     await refreshSubscriptions();
@@ -814,9 +814,9 @@ app.listen(PORT, HOST, async () => {
     fetchDvolLatest('BTC').then((v) => {
       if (v != null) {
         updateDvol('btc_usd', v);
-        console.log(`[qop-backend] DVOL bootstrapped at ${v.toFixed(2)}%`);
+        console.log(`[dm-capital-backend] DVOL bootstrapped at ${v.toFixed(2)}%`);
       }
-    }).catch((err) => console.error('[qop-backend] DVOL bootstrap failed', err));
+    }).catch((err) => console.error('[dm-capital-backend] DVOL bootstrap failed', err));
 
     // Phase 11: restore last aggregator snapshot if it exists (B8.3 fix).
     try {
@@ -826,15 +826,15 @@ app.listen(PORT, HOST, async () => {
       if (lastSnap) {
         const parsed = JSON.parse(lastSnap.buckets) as Record<string, { signedNotional: number; buyCount: number; sellCount: number }>;
         flowAggregator.restoreBuckets(parsed);
-        console.log(`[qop-backend] restored ${Object.keys(parsed).length} aggregator buckets from snapshot ${lastSnap.ts.toISOString()}`);
+        console.log(`[dm-capital-backend] restored ${Object.keys(parsed).length} aggregator buckets from snapshot ${lastSnap.ts.toISOString()}`);
       }
     } catch (err) {
-      console.error('[qop-backend] aggregator restore failed', err);
+      console.error('[dm-capital-backend] aggregator restore failed', err);
     }
 
     startPersistenceTimers();
   } catch (err) {
-    console.error('[qop-backend] ws bootstrap failed', err);
+    console.error('[dm-capital-backend] ws bootstrap failed', err);
   }
 });
 
