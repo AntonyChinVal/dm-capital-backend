@@ -1,10 +1,17 @@
 node_modules
 dist
-.env
-.env.local
 *.log
 .DS_Store
 
-# Prisma / SQLite
-data/*.db
-data/*.db-journal
+# Env — local only; commit .env.example
+.env
+.env.*
+!.env.example
+
+# Prisma / SQLite — never commit local DB files
+data/
+data/**/*.db
+data/**/*.db-journal
+prisma/data/
+*.db
+*.db-journal

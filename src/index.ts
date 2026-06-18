@@ -4,11 +4,13 @@ import { prisma } from './db.js';
 import { fetchBookSummary, fetchDvolLatest, fetchIndexPrice } from './deribit/rest.js';
 import { DeribitWS } from './deribit/ws.js';
 import { parseInstrument } from './compute/parseInstrument.js';
-import { ivCurve } from './compute/iv.js';
-import { maxPain, oiByStrike } from './compute/oi.js';
-import { gexByStrike, regimeReport } from './compute/gex.js';
+import {
+  computeMetricsBundle,
+  parseBookRows,
+  buildSkewTermStructure,
+} from './compute/metricsBundle.js';
+import { filterLiquidStrikes } from './compute/liquidStrikes.js';
 import { buildSurface } from './compute/ivSurface.js';
-import { skew25d } from './compute/skew.js';
 import { atmIv } from './compute/atmIv.js';
 import { classifyExpiration } from './compute/classifyExpiration.js';
 import { expectedMoveBands } from './compute/expectedMove.js';
@@ -327,59 +329,23 @@ app.get('/api/synthesis', async (req: Request, res: Response) => {
       fetchBookSummary(currency),
     ]);
 
-    const rows = summary
-      .map((row) => {
-        const p = parseInstrument(row.instrument_name);
-        if (!p) return null;
-        return {
-          ...p,
-          openInterest: row.open_interest,
-          markIv: row.mark_iv ?? 0,
-          underlyingPrice: row.underlying_price,
-        };
-      })
-      .filter((r): r is NonNullable<typeof r> => r !== null);
-
-    const expRows = rows.filter((r) => r.expiration === expiration);
+    const allRows = parseBookRows(summary);
+    const expRows = allRows.filter((r) => r.expiration === expiration);
     if (!expRows.length) {
       return res.status(404).json({ error: `no instruments for expiration ${expiration}` });
     }
 
-    // Replicate the minimal compute path from /api/metrics — keep them in sync.
-    const future = expRows[0].underlyingPrice;
-    const oi = oiByStrike(expRows);
-    const gexRows = expRows
-      .map((r) => {
-        const g = getGreeks(r.instrument);
-        return g?.gamma != null && Number.isFinite(g.gamma)
-          ? { strike: r.strike, type: r.type, openInterest: r.openInterest, gamma: g.gamma }
-          : null;
-      })
-      .filter((x): x is NonNullable<typeof x> => x !== null);
-    const gex = gexByStrike(gexRows, future);
-    const levels = regimeReport(gex, future);
+    const bundle = computeMetricsBundle(
+      allRows,
+      expiration,
+      'market',
+      indexPrice.index_price,
+    );
+    if (!bundle) {
+      return res.status(404).json({ error: `no instruments for expiration ${expiration}` });
+    }
 
-    // Surface for headline skew + skew tiles
-    const futureRows = rows
-      .filter((r) => r.expirationTimestamp > Date.now())
-      .map((r) => ({
-        instrument: r.instrument,
-        strike: r.strike,
-        type: r.type,
-        markIv: r.markIv,
-        expiration: r.expiration,
-        expirationTimestamp: r.expirationTimestamp,
-      }));
-    const surface = buildSurface(futureRows, 6);
-    const termStructure = surface.rows.map((sr) => {
-      const sr_rows = futureRows.filter((r) => r.expiration === sr.expiration);
-      const sk = skew25d(sr_rows);
-      return {
-        expiration: sr.expiration,
-        tenorDays: sr.tenorDays,
-        skew25d: sk.skew25d,
-      };
-    });
+    const termStructure = buildSkewTermStructure(allRows, 8);
     const headlineSkew = termStructure[0]?.skew25d ?? null;
     const skewTiles = pickSkewTiles(termStructure);
 
@@ -388,9 +354,9 @@ app.get('/api/synthesis', async (req: Request, res: Response) => {
 
     // Next OPEX for the bridge text — first non-daily expiration
     const nextOpex = (() => {
-      const all = [...new Set(rows.map((r) => r.expiration))]
+      const all = [...new Set(allRows.map((r) => r.expiration))]
         .map((exp) => {
-          const r = rows.find((x) => x.expiration === exp);
+          const r = allRows.find((x) => x.expiration === exp);
           return r ? { expiration: exp, ts: r.expirationTimestamp } : null;
         })
         .filter((x): x is { expiration: string; ts: number } => x !== null)
@@ -405,14 +371,14 @@ app.get('/api/synthesis', async (req: Request, res: Response) => {
 
     const panorama = buildPanorama({
       spot: indexPrice.index_price,
-      gammaFlip: levels.gammaFlip,
-      callWall: levels.callWall,
-      putWall: levels.putWall,
+      gammaFlip: bundle.macro.gammaFlip,
+      callWall: bundle.macro.callWall,
+      putWall: bundle.macro.putWall,
       headlineSkew,
       signedNotional: flowNet.signedNotional,
     });
 
-    const bridgeText = buildBridgeText(levels.callWall, levels.putWall, nextOpex);
+    const bridgeText = buildBridgeText(bundle.macro.callWall, bundle.macro.putWall, nextOpex);
 
     res.json({
       currency,
@@ -420,7 +386,8 @@ app.get('/api/synthesis', async (req: Request, res: Response) => {
       window,
       fetchedAt: Date.now(),
       spot: indexPrice.index_price,
-      future,
+      future: bundle.future,
+      macro: bundle.macro,
       panorama,
       bridgeText,
       skewTiles,
@@ -640,80 +607,65 @@ app.get('/api/expirations', async (req: Request, res: Response) => {
 app.get('/api/metrics', async (req: Request, res: Response) => {
   try {
     const currency = typeof req.query.currency === 'string' ? req.query.currency : 'BTC';
+    const indexName = currency === 'BTC' ? 'btc_usd' : 'eth_usd';
     const expiration = (typeof req.query.expiration === 'string' ? req.query.expiration : '').toUpperCase();
     if (!expiration) {
       return res.status(400).json({ error: 'expiration query param is required' });
     }
+    const scopeParam = String(req.query.scope ?? 'market').toLowerCase();
+    const scope = scopeParam === 'expiration' ? 'expiration' : 'market';
 
-    const data = await fetchBookSummary(currency);
+    const [indexPrice, data] = await Promise.all([
+      fetchIndexPrice(indexName),
+      fetchBookSummary(currency),
+    ]);
 
-    const rows = data
-      .map((row) => {
-        const p = parseInstrument(row.instrument_name);
-        if (!p) return null;
-        return {
-          ...p,
-          openInterest: row.open_interest,
-          markIv: row.mark_iv ?? 0,
-          underlyingPrice: row.underlying_price,
-        };
-      })
-      .filter((r): r is NonNullable<typeof r> => r !== null && r.expiration === expiration);
-
-    if (!rows.length) {
+    const allRows = parseBookRows(data);
+    const bundle = computeMetricsBundle(
+      allRows,
+      expiration,
+      scope,
+      indexPrice.index_price,
+    );
+    if (!bundle) {
       return res.status(404).json({ error: `no instruments for expiration ${expiration}` });
     }
 
-    const future = rows[0].underlyingPrice;
-    const oi = oiByStrike(rows);
-    const mp = maxPain(oi);
-    const iv = ivCurve(rows);
+    const expiryLevels = computeMetricsBundle(
+      allRows,
+      expiration,
+      'expiration',
+      indexPrice.index_price,
+    );
 
-    // GEX from WS-fed greeks store
-    const gexRows = rows
-      .map((r) => {
-        const g = getGreeks(r.instrument);
-        return g?.gamma != null && Number.isFinite(g.gamma)
-          ? {
-              strike: r.strike,
-              type: r.type,
-              openInterest: r.openInterest,
-              gamma: g.gamma,
-            }
-          : null;
-      })
-      .filter((r): r is NonNullable<typeof r> => r !== null);
-
-    const gex = gexByStrike(gexRows, future);
-    const levels = regimeReport(gex, future);
-
-    // Phase 5: signal rules tied to metrics computation
-    alertStream.push(checkFlipCross(expiration, future, levels.gammaFlip));
-    alertStream.push(checkWallApproach(expiration, future, levels.callWall, levels.putWall));
-
-    // Phase 7: Expected Move bands for the selected expiration (Hernán Q6.c — both EMs)
-    const atmIvValue = atmIv(rows, future);
-    const daysToExpiry = (rows[0].expirationTimestamp - Date.now()) / 86_400_000;
-    const expectedMove = atmIvValue != null
-      ? expectedMoveBands(future, atmIvValue, daysToExpiry)
-      : null;
+    alertStream.push(checkFlipCross(expiration, bundle.future, expiryLevels?.gammaFlip ?? null));
+    alertStream.push(
+      checkWallApproach(
+        expiration,
+        bundle.future,
+        bundle.callWall,
+        bundle.putWall,
+      ),
+    );
 
     res.json({
       currency,
       expiration,
+      scope: bundle.scope,
       fetchedAt: Date.now(),
-      future,
-      count: rows.length,
-      maxPain: mp?.strike ?? null,
-      oi,
-      ivCurve: iv,
-      gex,
-      gexCovered: gexRows.length,
-      gammaFlip: levels.gammaFlip,
-      callWall: levels.callWall,
-      putWall: levels.putWall,
-      regime: levels.regime,
-      expectedMove,
+      future: bundle.future,
+      count: bundle.count,
+      maxPain: bundle.maxPain,
+      oi: bundle.oi,
+      ivCurve: bundle.ivCurve,
+      gex: bundle.gex,
+      gexCovered: bundle.gexCovered,
+      gammaFlip: bundle.gammaFlip,
+      callWall: bundle.callWall,
+      putWall: bundle.putWall,
+      regime: bundle.regime,
+      expectedMove: bundle.expectedMove,
+      macro: bundle.macro,
     });
   } catch (err) {
     res.status(502).json({ error: err instanceof Error ? err.message : String(err) });
@@ -723,34 +675,22 @@ app.get('/api/metrics', async (req: Request, res: Response) => {
 app.get('/api/surface', async (req: Request, res: Response) => {
   try {
     const currency = typeof req.query.currency === 'string' ? req.query.currency : 'BTC';
-    const tenors = Math.max(2, Math.min(8, Number(req.query.tenors ?? 6)));
+    const tenors = Math.max(2, Math.min(8, Number(req.query.tenors ?? 8)));
 
     const data = await fetchBookSummary(currency);
-    const now = Date.now();
-    const rows = data
-      .map((row) => {
-        const p = parseInstrument(row.instrument_name);
-        if (!p || p.expirationTimestamp <= now) return null;
-        return {
-          ...p,
-          markIv: row.mark_iv ?? 0,
-        };
-      })
-      .filter((r): r is NonNullable<typeof r> => r !== null);
+    const allRows = parseBookRows(data);
+    const liquid = filterLiquidStrikes(allRows);
+    const surfaceInput = liquid.map((r) => ({
+      instrument: r.instrument,
+      strike: r.strike,
+      type: r.type,
+      markIv: r.markIv,
+      expiration: r.expiration,
+      expirationTimestamp: r.expirationTimestamp,
+    }));
 
-    const surface = buildSurface(rows, tenors);
-
-    const termStructure = surface.rows.map((sr) => {
-      const expRows = rows.filter((r) => r.expiration === sr.expiration);
-      const sk = skew25d(expRows);
-      return {
-        expiration: sr.expiration,
-        tenorDays: sr.tenorDays,
-        skew25d: sk.skew25d,
-        callIv: sk.callIv ?? null,
-        putIv: sk.putIv ?? null,
-      };
-    });
+    const surface = buildSurface(surfaceInput, tenors);
+    const termStructure = buildSkewTermStructure(allRows, tenors);
 
     // Phase 5: structural-fear rule
     alertStream.push(checkStructuralFear(termStructure));
@@ -855,62 +795,39 @@ async function snapshotIndexTick(): Promise<void> {
 
 async function snapshotAllMetrics(): Promise<void> {
   try {
-    const data = await fetchBookSummary('BTC');
-    const now = Date.now();
-    // Group by expiration
-    const byExp = new Map<string, typeof data>();
-    for (const row of data) {
-      const p = parseInstrument(row.instrument_name);
-      if (!p || p.expirationTimestamp <= now) continue;
-      const bucket = byExp.get(p.expiration) ?? [];
-      bucket.push(row);
-      byExp.set(p.expiration, bucket);
-    }
+    const [data, indexPrice] = await Promise.all([
+      fetchBookSummary('BTC'),
+      fetchIndexPrice('btc_usd'),
+    ]);
+    const allRows = parseBookRows(data);
     const ts = new Date();
-    for (const [expiration, rows] of byExp) {
-      const parsed = rows
-        .map((row) => {
-          const p = parseInstrument(row.instrument_name);
-          return p
-            ? {
-                ...p,
-                openInterest: row.open_interest,
-                markIv: row.mark_iv ?? 0,
-                underlyingPrice: row.underlying_price,
-              }
-            : null;
-        })
-        .filter((r): r is NonNullable<typeof r> => r !== null);
-      if (!parsed.length) continue;
-      const future = parsed[0].underlyingPrice;
-      const oi = oiByStrike(parsed);
-      const mp = maxPain(oi);
-      const gexRows = parsed
-        .map((r) => {
-          const g = getGreeks(r.instrument);
-          return g?.gamma != null && Number.isFinite(g.gamma)
-            ? { strike: r.strike, type: r.type, openInterest: r.openInterest, gamma: g.gamma }
-            : null;
-        })
-        .filter((r): r is NonNullable<typeof r> => r !== null);
-      const gex = gexByStrike(gexRows, future);
-      const levels = regimeReport(gex, future);
-      const atm = atmIv(parsed, future);
+    const expirations = [...new Set(allRows.map((r) => r.expiration))];
+
+    for (const expiration of expirations) {
+      const bundle = computeMetricsBundle(
+        allRows,
+        expiration,
+        'expiration',
+        indexPrice.index_price,
+        ts.getTime(),
+      );
+      if (!bundle) continue;
+
       persistMetricSnapshot({
         ts,
         currency: 'BTC',
         expiration,
-        future,
-        maxPain: mp?.strike ?? null,
-        gammaFlip: levels.gammaFlip,
-        callWall: levels.callWall,
-        putWall: levels.putWall,
-        regime: levels.regime,
-        oi,
-        gex,
-        atmIv: atm,
-        count: parsed.length,
-        gexCovered: gexRows.length,
+        future: bundle.future,
+        maxPain: bundle.maxPain,
+        gammaFlip: bundle.gammaFlip,
+        callWall: bundle.callWall,
+        putWall: bundle.putWall,
+        regime: bundle.regime,
+        oi: bundle.oi,
+        gex: bundle.gex,
+        atmIv: atmIv(filterLiquidStrikes(allRows.filter((r) => r.expiration === expiration)), bundle.future),
+        count: bundle.count,
+        gexCovered: bundle.gexCovered,
       });
     }
   } catch (err) {
@@ -921,26 +838,8 @@ async function snapshotAllMetrics(): Promise<void> {
 async function snapshotSurface(): Promise<void> {
   try {
     const data = await fetchBookSummary('BTC');
-    const now = Date.now();
-    const rows = data
-      .map((row) => {
-        const p = parseInstrument(row.instrument_name);
-        if (!p || p.expirationTimestamp <= now) return null;
-        return { ...p, markIv: row.mark_iv ?? 0 };
-      })
-      .filter((r): r is NonNullable<typeof r> => r !== null);
-    const surface = buildSurface(rows, 6);
-    const termStructure = surface.rows.map((sr) => {
-      const expRows = rows.filter((r) => r.expiration === sr.expiration);
-      const sk = skew25d(expRows);
-      return {
-        expiration: sr.expiration,
-        tenorDays: sr.tenorDays,
-        skew25d: sk.skew25d,
-        callIv: sk.callIv ?? null,
-        putIv: sk.putIv ?? null,
-      };
-    });
+    const allRows = parseBookRows(data);
+    const termStructure = buildSkewTermStructure(allRows, 8);
     persistSurfaceSnapshot({
       ts: new Date(),
       currency: 'BTC',

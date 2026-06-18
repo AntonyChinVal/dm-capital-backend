@@ -6,6 +6,8 @@
   "description": "DM Capital backend — Deribit BTC options gateway",
   "scripts": {
     "dev": "tsx watch src/index.ts",
+    "dev:local": "tsx watch src/index.ts",
+    "setup": "prisma migrate dev",
     "build": "tsc",
     "start": "node dist/index.js",
     "typecheck": "tsc --noEmit",
