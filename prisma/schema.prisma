@@ -1,0 +1,99 @@
+// QOP Terminal — Persistence schema
+// SQLite (single instance per Hernán Q21.a).
+// Schema designed backtest-ready per Hernán Q18 — captures enough payload
+// to re-evaluate Phase 9 interpretation rules over historical data.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model MetricSnapshot {
+  id          Int      @id @default(autoincrement())
+  ts          DateTime
+  currency    String   @default("BTC")
+  expiration  String
+
+  // Scalar levels — feed mini-charts (sparklines per Hernán Q22)
+  future      Float
+  maxPain     Float?
+  gammaFlip   Float?
+  callWall    Float?
+  putWall     Float?
+
+  // Regime classification (for Panorama replay)
+  regime      String   // 'positive' | 'negative' | 'unknown'
+
+  // Backtest payload — JSON of arrays so Phase 9 rules can replay
+  oiSummary    String   // JSON: [{strike, callsOI, putsOI}]
+  gexSummary   String   // JSON: [{strike, callGex, putGex, netGex}]
+  atmIv        Float?
+  count        Int
+  gexCovered   Int
+
+  @@index([currency, expiration, ts])
+  @@index([ts])
+}
+
+model SurfaceSnapshot {
+  id            Int      @id @default(autoincrement())
+  ts            DateTime
+  currency      String   @default("BTC")
+  headlineSkew  Float?
+  // termStructure JSON: [{expiration, tenorDays, skew25d, callIv, putIv}]
+  termStructure String
+
+  @@index([currency, ts])
+}
+
+model FlowTrade {
+  id             String   @id // Deribit trade_id
+  ts             DateTime
+  expiration     String
+  strike         Float
+  type           String   // 'C' | 'P'
+  side           String   // 'buy' | 'sell'
+  tag            String   // 'block' | 'large'
+  amount         Float
+  notionalUsd    Float
+  signedNotional Float    // directional sentiment (Hernán Q8 locked)
+  iv             Float?
+  priorIv        Float?
+  ivDelta        Float?
+  interp         String
+
+  @@index([ts])
+  @@index([expiration, ts])
+  @@index([tag, ts])
+}
+
+model FlowAggregateSnapshot {
+  ts      DateTime @id
+  // JSON: { "1781630400000": +12345.6, ... } — minute buckets
+  buckets String
+}
+
+model AlertLog {
+  id           String   @id // dedup key
+  firstSeen    DateTime
+  kind         String   // 'flip' | 'wall' | 'block' | 'skew'
+  severity     String   // 'info' | 'warn' | 'critical'
+  title        String
+  message      String
+  contextJson  String?
+
+  @@index([firstSeen])
+  @@index([kind, severity])
+}
+
+model IndexTick {
+  ts        DateTime @id
+  indexName String   @default("btc_usd")
+  price     Float
+
+  @@index([indexName, ts])
+}

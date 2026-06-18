@@ -1,0 +1,14 @@
+packages:
+  - .
+
+allowBuilds:
+  esbuild: true
+  '@prisma/client': true
+  '@prisma/engines': true
+  prisma: true
+
+onlyBuiltDependencies:
+  - esbuild
+  - '@prisma/client'
+  - '@prisma/engines'
+  - prisma
