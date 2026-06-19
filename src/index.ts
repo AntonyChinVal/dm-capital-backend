@@ -10,12 +10,13 @@ import {
   buildSkewTermStructure,
 } from './compute/metricsBundle.js';
 import { filterLiquidStrikes } from './compute/liquidStrikes.js';
+import { filterCurveStrikes } from './compute/curveFilter.js';
 import { buildSurface } from './compute/ivSurface.js';
 import { atmIv } from './compute/atmIv.js';
 import { classifyExpiration } from './compute/classifyExpiration.js';
 import { expectedMoveBands } from './compute/expectedMove.js';
 import { buildPanorama, buildBridgeText } from './compute/interpret/synthesis.js';
-import { pickSkewTiles } from './compute/interpret/skewTiles.js';
+import { pickSkewTiles, pickHeadlineSkew } from './compute/interpret/skewTiles.js';
 import {
   checkFlipCross,
   checkLargeCallBlock,
@@ -346,7 +347,7 @@ app.get('/api/synthesis', async (req: Request, res: Response) => {
     }
 
     const termStructure = buildSkewTermStructure(allRows, 8);
-    const headlineSkew = termStructure[0]?.skew25d ?? null;
+    const headlineSkew = pickHeadlineSkew(termStructure);
     const skewTiles = pickSkewTiles(termStructure);
 
     // Net flow for the requested window
@@ -643,8 +644,8 @@ app.get('/api/metrics', async (req: Request, res: Response) => {
       checkWallApproach(
         expiration,
         bundle.future,
-        bundle.callWall,
-        bundle.putWall,
+        expiryLevels?.local.resistance ?? null,
+        expiryLevels?.local.support ?? null,
       ),
     );
 
@@ -666,6 +667,8 @@ app.get('/api/metrics', async (req: Request, res: Response) => {
       regime: bundle.regime,
       expectedMove: bundle.expectedMove,
       macro: bundle.macro,
+      local: bundle.local,
+      walls: bundle.walls,
     });
   } catch (err) {
     res.status(502).json({ error: err instanceof Error ? err.message : String(err) });
@@ -680,7 +683,8 @@ app.get('/api/surface', async (req: Request, res: Response) => {
     const data = await fetchBookSummary(currency);
     const allRows = parseBookRows(data);
     const liquid = filterLiquidStrikes(allRows);
-    const surfaceInput = liquid.map((r) => ({
+    const curveLiquid = filterCurveStrikes(liquid);
+    const surfaceInput = curveLiquid.map((r) => ({
       instrument: r.instrument,
       strike: r.strike,
       type: r.type,
@@ -706,7 +710,7 @@ app.get('/api/surface', async (req: Request, res: Response) => {
       })),
       iv: surface.rows.map((sr) => sr.iv),
       termStructure,
-      headlineSkew: termStructure[0]?.skew25d ?? null,
+      headlineSkew: pickHeadlineSkew(termStructure),
     });
   } catch (err) {
     res.status(502).json({ error: err instanceof Error ? err.message : String(err) });
@@ -843,7 +847,7 @@ async function snapshotSurface(): Promise<void> {
     persistSurfaceSnapshot({
       ts: new Date(),
       currency: 'BTC',
-      headlineSkew: termStructure[0]?.skew25d ?? null,
+      headlineSkew: pickHeadlineSkew(termStructure),
       termStructure,
     });
   } catch (err) {

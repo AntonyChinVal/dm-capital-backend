@@ -132,6 +132,40 @@ export function putWall(points: GEXPoint[]): number | null {
   return w.putGex > 0 ? w.strike : null;
 }
 
+/** Local resistance — max positive net GEX above ref price (per expiry). */
+export function resistanceWall(points: GEXPoint[], refPrice: number): number | null {
+  if (!points.length || refPrice <= 0) return null;
+  const above = points.filter((p) => p.strike > refPrice && p.netGex > 0);
+  if (!above.length) return null;
+  const w = above.reduce((a, b) => (b.netGex > a.netGex ? b : a));
+  return w.strike;
+}
+
+/** Local support — max put GEX below ref price (per expiry). */
+export function supportWall(points: GEXPoint[], refPrice: number): number | null {
+  if (!points.length || refPrice <= 0) return null;
+  const below = points.filter((p) => p.strike < refPrice && p.putGex > 0);
+  if (!below.length) return null;
+  const w = below.reduce((a, b) => (b.putGex > a.putGex ? b : a));
+  return w.strike;
+}
+
+/** Structural call wall — max positive net GEX on the full book. */
+export function structuralCallWall(points: GEXPoint[]): number | null {
+  if (!points.length) return null;
+  const positive = points.filter((p) => p.netGex > 0);
+  if (!positive.length) return callWall(points);
+  const w = positive.reduce((a, b) => (b.netGex > a.netGex ? b : a));
+  return w.strike;
+}
+
+/** Structural put wall — max put GEX below index spot on the full book. */
+export function structuralPutWall(points: GEXPoint[], refPrice: number): number | null {
+  const below = supportWall(points, refPrice);
+  if (below != null) return below;
+  return putWall(points);
+}
+
 export function totalNetGex(points: GEXPoint[]): number {
   return points.reduce((s, p) => s + p.netGex, 0);
 }

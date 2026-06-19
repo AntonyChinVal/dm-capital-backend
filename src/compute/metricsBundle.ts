@@ -1,11 +1,17 @@
 import type { BookSummary } from '../types.js';
+import { gammaB76 } from './black76.js';
 import { parseInstrument } from './parseInstrument.js';
 import { filterLiquidStrikes } from './liquidStrikes.js';
+import { filterCurveStrikes } from './curveFilter.js';
 import { ivCurve } from './iv.js';
 import { oiByStrike, maxPain } from './oi.js';
 import {
   gexByStrike,
   regimeReport,
+  resistanceWall,
+  structuralCallWall,
+  structuralPutWall,
+  supportWall,
   type GexInput,
   type GexSweepOption,
   type GEXPoint,
@@ -31,13 +37,37 @@ export interface ParsedOptionRow {
 }
 
 export type MetricsScope = 'market' | 'expiration';
+export type LevelScope = 'global' | 'local';
+
+export interface LevelMetric {
+  value: number | null;
+  expiration: string | null;
+  scope: LevelScope;
+}
+
+export interface WallsBundle {
+  marketGammaFlip: LevelMetric;
+  structuralCallWall: LevelMetric;
+  structuralPutWall: LevelMetric;
+  localResistance: LevelMetric;
+  localSupport: LevelMetric;
+  maxPain: LevelMetric;
+}
 
 export interface MacroLevels {
   gammaFlip: number | null;
+  /** Full-book structural call wall (max GEX calls). */
   callWall: number | null;
+  /** Full-book structural put wall (max GEX puts). */
   putWall: number | null;
   regime: Regime;
   netGex: number;
+}
+
+export interface LocalLevels {
+  resistance: number | null;
+  support: number | null;
+  expiration: string;
 }
 
 export interface MetricsBundle {
@@ -54,7 +84,17 @@ export interface MetricsBundle {
   regime: Regime;
   expectedMove: ReturnType<typeof expectedMoveBands> | null;
   macro: MacroLevels;
+  local: LocalLevels;
+  walls: WallsBundle;
   scope: MetricsScope;
+}
+
+function globalLevel(value: number | null): LevelMetric {
+  return { value, expiration: null, scope: 'global' };
+}
+
+function localLevel(value: number | null, expiration: string): LevelMetric {
+  return { value, expiration, scope: 'local' };
 }
 
 export function parseBookRows(data: BookSummary[], now = Date.now()): ParsedOptionRow[] {
@@ -82,16 +122,29 @@ export function tenorYears(expirationTimestamp: number, now = Date.now()): numbe
   return Math.max(1 / (365 * 24 * 3600), (expirationTimestamp - now) / (365 * 24 * 3600 * 1000));
 }
 
-function toGexRows(rows: ParsedOptionRow[]): GexInput[] {
+function rowGamma(r: ParsedOptionRow, now: number): number | null {
+  const g = getGreeks(r.instrument);
+  if (g?.gamma != null && Number.isFinite(g.gamma) && g.gamma !== 0) return g.gamma;
+  if (r.markIv <= 0) return null;
+  return gammaB76(
+    r.underlyingPrice,
+    r.strike,
+    tenorYears(r.expirationTimestamp, now),
+    r.markIv,
+    r.interestRate,
+  );
+}
+
+function toGexRows(rows: ParsedOptionRow[], now = Date.now()): GexInput[] {
   const out: GexInput[] = [];
   for (const r of rows) {
-    const g = getGreeks(r.instrument);
-    if (g?.gamma == null || !Number.isFinite(g.gamma)) continue;
+    const gamma = rowGamma(r, now);
+    if (gamma == null || !Number.isFinite(gamma) || gamma === 0) continue;
     out.push({
       strike: r.strike,
       type: r.type,
       openInterest: r.openInterest,
-      gamma: g.gamma,
+      gamma,
       spot: r.underlyingPrice,
     });
   }
@@ -114,6 +167,7 @@ function toSweepOptions(rows: ParsedOptionRow[], now = Date.now()): GexSweepOpti
 function computeScopeLevels(
   liquidRows: ParsedOptionRow[],
   refSpot: number,
+  wallRefPrice: number,
   now = Date.now(),
 ): {
   gex: GEXPoint[];
@@ -121,10 +175,14 @@ function computeScopeLevels(
   gammaFlip: number | null;
   callWall: number | null;
   putWall: number | null;
+  resistance: number | null;
+  support: number | null;
+  structuralCall: number | null;
+  structuralPut: number | null;
   regime: Regime;
   netGex: number;
 } {
-  const gexRows = toGexRows(liquidRows);
+  const gexRows = toGexRows(liquidRows, now);
   const refPrice =
     liquidRows[0]?.underlyingPrice ??
     refSpot;
@@ -137,6 +195,10 @@ function computeScopeLevels(
     gammaFlip: levels.gammaFlip,
     callWall: levels.callWall,
     putWall: levels.putWall,
+    resistance: resistanceWall(gex, wallRefPrice),
+    support: supportWall(gex, wallRefPrice),
+    structuralCall: structuralCallWall(gex),
+    structuralPut: structuralPutWall(gex, refSpot),
     regime: levels.regime,
     netGex: levels.netGex,
   };
@@ -157,10 +219,15 @@ export function computeMetricsBundle(
   const liquidBook = filterLiquidStrikes(allRows);
 
   const scopeRows = scope === 'market' ? liquidBook : liquidExp;
-  const scopeLevels = computeScopeLevels(scopeRows, spotPrice, now);
+  const scopeLevels = computeScopeLevels(scopeRows, spotPrice, future, now);
 
   const liquidMacro = filterLiquidStrikes(allRows);
-  const macroLevels = computeScopeLevels(liquidMacro, spotPrice, now);
+  const macroLevels = computeScopeLevels(liquidMacro, spotPrice, spotPrice, now);
+  const localLevels = computeScopeLevels(liquidExp, spotPrice, future, now);
+
+  const scopeCallWall =
+    scope === 'market' ? macroLevels.structuralCall : localLevels.resistance;
+  const scopePutWall = scope === 'market' ? macroLevels.structuralPut : localLevels.support;
 
   const oi =
     scope === 'market'
@@ -175,40 +242,58 @@ export function computeMetricsBundle(
 
   const mp = maxPain(oiByStrike(expRows));
 
-  const iv =
-    scope === 'market' ? ivCurve(liquidBook) : ivCurve(liquidExp);
+  const curveSource =
+    scope === 'market'
+      ? filterCurveStrikes(liquidBook, { now })
+      : filterCurveStrikes(liquidExp, { now });
+  const iv = ivCurve(curveSource);
 
   const atmIvValue = atmIv(liquidExp, future);
   const daysToExpiry = (expRows[0].expirationTimestamp - now) / 86_400_000;
   const expectedMove =
     atmIvValue != null ? expectedMoveBands(future, atmIvValue, daysToExpiry) : null;
 
+  const maxPainStrike = mp?.strike ?? null;
+
   return {
     future,
     count: expRows.length,
-    maxPain: mp?.strike ?? null,
+    maxPain: maxPainStrike,
     oi,
     ivCurve: iv,
     gex: scopeLevels.gex,
     gexCovered: scopeLevels.gexCovered,
     gammaFlip: scopeLevels.gammaFlip,
-    callWall: scopeLevels.callWall,
-    putWall: scopeLevels.putWall,
+    callWall: scopeCallWall,
+    putWall: scopePutWall,
     regime: scopeLevels.regime,
     expectedMove,
     macro: {
       gammaFlip: macroLevels.gammaFlip,
-      callWall: macroLevels.callWall,
-      putWall: macroLevels.putWall,
+      callWall: macroLevels.structuralCall,
+      putWall: macroLevels.structuralPut,
       regime: macroLevels.regime,
       netGex: macroLevels.netGex,
+    },
+    local: {
+      resistance: localLevels.resistance,
+      support: localLevels.support,
+      expiration,
+    },
+    walls: {
+      marketGammaFlip: globalLevel(macroLevels.gammaFlip),
+      structuralCallWall: globalLevel(macroLevels.structuralCall),
+      structuralPutWall: globalLevel(macroLevels.structuralPut),
+      localResistance: localLevel(localLevels.resistance, expiration),
+      localSupport: localLevel(localLevels.support, expiration),
+      maxPain: localLevel(maxPainStrike, expiration),
     },
     scope,
   };
 }
 
 export function skewInputsFromRows(rows: ParsedOptionRow[], now = Date.now()) {
-  return filterLiquidStrikes(rows).map((r) => ({
+  return filterCurveStrikes(filterLiquidStrikes(rows), { now }).map((r) => ({
     strike: r.strike,
     type: r.type,
     markIv: r.markIv,
@@ -219,8 +304,8 @@ export function skewInputsFromRows(rows: ParsedOptionRow[], now = Date.now()) {
 }
 
 export function buildSkewTermStructure(allRows: ParsedOptionRow[], maxTenors = 8, now = Date.now()) {
-  const liquid = filterLiquidStrikes(allRows);
-  const surfaceInput = liquid.map((r) => ({
+  const curveLiquid = filterCurveStrikes(filterLiquidStrikes(allRows), { now });
+  const surfaceInput = curveLiquid.map((r) => ({
     instrument: r.instrument,
     strike: r.strike,
     type: r.type,
@@ -230,7 +315,7 @@ export function buildSkewTermStructure(allRows: ParsedOptionRow[], maxTenors = 8
   }));
   const surface = buildSurface(surfaceInput, maxTenors);
   return surface.rows.map((sr) => {
-    const expRows = liquid.filter((r) => r.expiration === sr.expiration);
+    const expRows = curveLiquid.filter((r) => r.expiration === sr.expiration);
     const sk = skew25d(skewInputsFromRows(expRows, now));
     return {
       expiration: sr.expiration,

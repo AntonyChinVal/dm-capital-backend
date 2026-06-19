@@ -50,3 +50,9 @@ export function pickSkewTiles(termStructure: TermPoint[]): SkewTile[] {
     };
   });
 }
+
+/** Headline skew — same 7D tenor as the first SkewTile (rigorous 25Δ). */
+export function pickHeadlineSkew(termStructure: TermPoint[]): number | null {
+  const tile = pickSkewTiles(termStructure).find((t) => t.targetDays === 7);
+  return tile?.skew25d ?? null;
+}
