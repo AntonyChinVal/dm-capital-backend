@@ -10,7 +10,7 @@ import {
   parseBookRows,
   buildSkewTermStructure,
 } from '../src/compute/metricsBundle.js';
-import { pickHeadlineSkew } from '../src/compute/interpret/skewTiles.js';
+import { pickHeadlineSkew, pickSkewTiles } from '../src/compute/interpret/skewTiles.js';
 import { filterLiquidStrikes } from '../src/compute/liquidStrikes.js';
 import { filterCurveStrikes } from '../src/compute/curveFilter.js';
 
@@ -41,8 +41,13 @@ function loadBook(path: string): BookSummary[] {
 }
 
 function pickSkew7d(allRows: ReturnType<typeof parseBookRows>): number | null {
-  const term = buildSkewTermStructure(allRows, 8, SNAPSHOT_AT);
+  const term = buildSkewTermStructure(allRows, { maxTenors: 'all' }, SNAPSHOT_AT);
   return pickHeadlineSkew(term);
+}
+
+function pickSkewTilesFromRows(allRows: ReturnType<typeof parseBookRows>) {
+  const term = buildSkewTermStructure(allRows, { maxTenors: 'all' }, SNAPSHOT_AT);
+  return pickSkewTiles(term);
 }
 
 function checkMax(
@@ -101,6 +106,9 @@ function main() {
   const local19 = computeMetricsBundle(allRows, exp19, 'expiration', SPOT, SNAPSHOT_AT);
   const local26 = computeMetricsBundle(allRows, exp26, 'expiration', SPOT, SNAPSHOT_AT);
   const skew7d = pickSkew7d(allRows);
+  const tiles = pickSkewTilesFromRows(allRows);
+  const tile90 = tiles.find((t) => t.targetDays === 90);
+  const tile180 = tiles.find((t) => t.targetDays === 180);
 
   if (!market || !local19 || !local26) {
     console.error('computeMetricsBundle returned null');
@@ -119,6 +127,8 @@ function main() {
     check('Max pain 19JUN', 65_000, local19.maxPain),
     check('Max pain 26JUN', 74_000, local26.maxPain),
     check('Skew 7D tile', 10.2, skew7d, 1.5, false),
+    check('Skew 90D tile', 6.6, tile90?.skew25d ?? null, 1.5, false),
+    check('Skew 180D tile', 5.1, tile180?.skew25d ?? null, 1.5, false),
   ];
 
   const local26Iv = local26.ivCurve;

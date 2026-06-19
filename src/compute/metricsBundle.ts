@@ -19,7 +19,7 @@ import {
 } from './gex.js';
 import { atmIv } from './atmIv.js';
 import { expectedMoveBands } from './expectedMove.js';
-import { buildSurface } from './ivSurface.js';
+import { classifyExpiration } from './classifyExpiration.js';
 import { skew25d } from './skew.js';
 import { getGreeks } from '../state/greeks.js';
 
@@ -164,10 +164,19 @@ function toSweepOptions(rows: ParsedOptionRow[], now = Date.now()): GexSweepOpti
     }));
 }
 
+function buildPutOiMap(rows: ParsedOptionRow[]): Map<number, number> {
+  const m = new Map<number, number>();
+  for (const r of rows) {
+    if (r.type === 'P') m.set(r.strike, (m.get(r.strike) ?? 0) + r.openInterest);
+  }
+  return m;
+}
+
 function computeScopeLevels(
   liquidRows: ParsedOptionRow[],
   refSpot: number,
   wallRefPrice: number,
+  opts?: { putOiByStrike?: Map<number, number> },
   now = Date.now(),
 ): {
   gex: GEXPoint[];
@@ -196,7 +205,7 @@ function computeScopeLevels(
     callWall: levels.callWall,
     putWall: levels.putWall,
     resistance: resistanceWall(gex, wallRefPrice),
-    support: supportWall(gex, wallRefPrice),
+    support: supportWall(gex, wallRefPrice, opts?.putOiByStrike),
     structuralCall: structuralCallWall(gex),
     structuralPut: structuralPutWall(gex, refSpot),
     regime: levels.regime,
@@ -219,11 +228,19 @@ export function computeMetricsBundle(
   const liquidBook = filterLiquidStrikes(allRows);
 
   const scopeRows = scope === 'market' ? liquidBook : liquidExp;
-  const scopeLevels = computeScopeLevels(scopeRows, spotPrice, future, now);
+  const scopeLevels = computeScopeLevels(scopeRows, spotPrice, future, undefined, now);
 
   const liquidMacro = filterLiquidStrikes(allRows);
-  const macroLevels = computeScopeLevels(liquidMacro, spotPrice, spotPrice, now);
-  const localLevels = computeScopeLevels(liquidExp, spotPrice, future, now);
+  const macroLevels = computeScopeLevels(liquidMacro, spotPrice, spotPrice, undefined, now);
+  const isDaily = classifyExpiration(expRows[0].expirationTimestamp) === 'D';
+  const localPutOi = isDaily ? buildPutOiMap(liquidExp) : undefined;
+  const localLevels = computeScopeLevels(
+    liquidExp,
+    spotPrice,
+    future,
+    localPutOi ? { putOiByStrike: localPutOi } : undefined,
+    now,
+  );
 
   const scopeCallWall =
     scope === 'market' ? macroLevels.structuralCall : localLevels.resistance;
@@ -303,23 +320,52 @@ export function skewInputsFromRows(rows: ParsedOptionRow[], now = Date.now()) {
   }));
 }
 
-export function buildSkewTermStructure(allRows: ParsedOptionRow[], maxTenors = 8, now = Date.now()) {
+export interface SkewTermStructureOptions {
+  /** Cap tenors for skew series; default = all expirations in the book. */
+  maxTenors?: number | 'all';
+  /** Drop same-day / 0DTE expirations (skew term chart). */
+  excludeZeroDte?: boolean;
+}
+
+export function buildSkewTermStructure(
+  allRows: ParsedOptionRow[],
+  opts: SkewTermStructureOptions | number = { maxTenors: 'all' },
+  now = Date.now(),
+) {
+  const options: SkewTermStructureOptions =
+    typeof opts === 'number' ? { maxTenors: opts } : opts;
+  const maxTenors = options.maxTenors ?? 'all';
+  const excludeZeroDte = options.excludeZeroDte ?? false;
+
   const curveLiquid = filterCurveStrikes(filterLiquidStrikes(allRows), { now });
-  const surfaceInput = curveLiquid.map((r) => ({
-    instrument: r.instrument,
-    strike: r.strike,
-    type: r.type,
-    markIv: r.markIv,
-    expiration: r.expiration,
-    expirationTimestamp: r.expirationTimestamp,
-  }));
-  const surface = buildSurface(surfaceInput, maxTenors);
-  return surface.rows.map((sr) => {
-    const expRows = curveLiquid.filter((r) => r.expiration === sr.expiration);
-    const sk = skew25d(skewInputsFromRows(expRows, now));
+  const byExp = new Map<string, { ts: number; rows: ParsedOptionRow[] }>();
+  for (const r of curveLiquid) {
+    let bucket = byExp.get(r.expiration);
+    if (!bucket) {
+      bucket = { ts: r.expirationTimestamp, rows: [] };
+      byExp.set(r.expiration, bucket);
+    }
+    bucket.rows.push(r);
+  }
+
+  let exps = [...byExp.entries()].sort((a, b) => a[1].ts - b[1].ts);
+
+  if (excludeZeroDte) {
+    exps = exps.filter(([, bucket]) => {
+      const tenorDays = Math.max(1, Math.round((bucket.ts - now) / 86_400_000));
+      return tenorDays > 1;
+    });
+  }
+
+  if (maxTenors !== 'all') {
+    exps = exps.slice(0, maxTenors);
+  }
+
+  return exps.map(([expiration, bucket]) => {
+    const sk = skew25d(skewInputsFromRows(bucket.rows, now));
     return {
-      expiration: sr.expiration,
-      tenorDays: sr.tenorDays,
+      expiration,
+      tenorDays: Math.max(1, Math.round((bucket.ts - now) / 86_400_000)),
       skew25d: sk.skew25d,
       callIv: sk.callIv ?? null,
       putIv: sk.putIv ?? null,

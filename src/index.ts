@@ -16,7 +16,7 @@ import { atmIv } from './compute/atmIv.js';
 import { classifyExpiration } from './compute/classifyExpiration.js';
 import { expectedMoveBands } from './compute/expectedMove.js';
 import { buildPanorama, buildBridgeText } from './compute/interpret/synthesis.js';
-import { pickSkewTiles, pickHeadlineSkew } from './compute/interpret/skewTiles.js';
+import { pickSkewTiles, pickHeadlineSkew, pickHeadlineSkew30d } from './compute/interpret/skewTiles.js';
 import {
   checkFlipCross,
   checkLargeCallBlock,
@@ -346,9 +346,10 @@ app.get('/api/synthesis', async (req: Request, res: Response) => {
       return res.status(404).json({ error: `no instruments for expiration ${expiration}` });
     }
 
-    const termStructure = buildSkewTermStructure(allRows, 8);
-    const headlineSkew = pickHeadlineSkew(termStructure);
-    const skewTiles = pickSkewTiles(termStructure);
+    const skewTermAll = buildSkewTermStructure(allRows, { maxTenors: 'all' });
+    const headlineSkew = pickHeadlineSkew(skewTermAll);
+    const headlineSkew30d = pickHeadlineSkew30d(skewTermAll);
+    const skewTiles = pickSkewTiles(skewTermAll);
 
     // Net flow for the requested window
     const flowNet = flowAggregator.netForWindow(windowMinutes);
@@ -393,6 +394,7 @@ app.get('/api/synthesis', async (req: Request, res: Response) => {
       bridgeText,
       skewTiles,
       headlineSkew,
+      headlineSkew30d,
       flowNet: {
         window,
         signedNotional: flowNet.signedNotional,
@@ -694,7 +696,10 @@ app.get('/api/surface', async (req: Request, res: Response) => {
     }));
 
     const surface = buildSurface(surfaceInput, tenors);
-    const termStructure = buildSkewTermStructure(allRows, tenors);
+    const termStructure = buildSkewTermStructure(allRows, {
+      maxTenors: 'all',
+      excludeZeroDte: true,
+    });
 
     // Phase 5: structural-fear rule
     alertStream.push(checkStructuralFear(termStructure));
@@ -711,6 +716,9 @@ app.get('/api/surface', async (req: Request, res: Response) => {
       iv: surface.rows.map((sr) => sr.iv),
       termStructure,
       headlineSkew: pickHeadlineSkew(termStructure),
+      headlineSkew30d: pickHeadlineSkew30d(
+        buildSkewTermStructure(allRows, { maxTenors: 'all' }),
+      ),
     });
   } catch (err) {
     res.status(502).json({ error: err instanceof Error ? err.message : String(err) });
@@ -843,7 +851,7 @@ async function snapshotSurface(): Promise<void> {
   try {
     const data = await fetchBookSummary('BTC');
     const allRows = parseBookRows(data);
-    const termStructure = buildSkewTermStructure(allRows, 8);
+    const termStructure = buildSkewTermStructure(allRows, { maxTenors: 'all' });
     persistSurfaceSnapshot({
       ts: new Date(),
       currency: 'BTC',

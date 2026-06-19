@@ -11,13 +11,13 @@ export type RegimenState =
 
 export function classifyRegimen(spot: number | null, gammaFlip: number | null): RegimenState {
   if (spot == null || gammaFlip == null || spot <= 0) return 'unknown';
-  const dist = (spot - gammaFlip) / spot; // positive when spot above flip
-  const { amplio, ajustado } = THRESHOLDS.bufferFlip;
+  const dist = (spot - gammaFlip) / spot;
+  const { settled, transition } = THRESHOLDS.bufferFlip;
   const abs = Math.abs(dist);
   const sign = dist >= 0 ? 'positive' : 'negative';
   let band: 'amplio' | 'ajustado' | 'critico';
-  if (abs > amplio) band = 'amplio';
-  else if (abs > ajustado) band = 'ajustado';
+  if (abs > settled) band = 'amplio';
+  else if (abs > transition) band = 'ajustado';
   else band = 'critico';
   return `${sign}_${band}` as RegimenState;
 }

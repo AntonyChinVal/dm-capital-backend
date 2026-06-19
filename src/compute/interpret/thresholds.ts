@@ -8,11 +8,11 @@
  * No DB write of thresholds, no historical re-tag needed.
  */
 export const THRESHOLDS = {
-  // % buffer between spot and gamma flip (Régimen tile)
+  // % distance spot ↔ gamma flip (Regime tile) — calibrated 19-Jun-2026
   bufferFlip: {
-    amplio: 0.10,   // > 10% → "colchón amplio"
-    ajustado: 0.04, // 4-10% → "colchón ajustado"
-    // < 4% → "spot pegado al flip" / crítico
+    settled: 0.04,      // > 4%  → wide buffer / settled
+    transition: 0.02,     // 2–4% → transition band
+    // < 2% → near flip / imminent
   },
 
   // 25Δ headline skew thresholds (Sesgo tile) — already in skewMood.ts, mirrored here

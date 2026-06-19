@@ -11,6 +11,7 @@ import {
   REGIMEN_FRAGMENTS,
   RANGETREND_FRAGMENTS,
   SESGO_FRAGMENTS,
+  regimenSub,
   type Severity,
   netflowSeverity,
   rangetrendSeverity,
@@ -49,7 +50,11 @@ export function buildPanorama(inputs: SynthesisInputs): PanoramaTile[] {
       dimension: 'regimen',
       state: regimen,
       severity: regimenSeverity(regimen),
-      ...REGIMEN_FRAGMENTS[regimen],
+      label: REGIMEN_FRAGMENTS[regimen].label,
+      sub:
+        inputs.spot != null && inputs.gammaFlip != null
+          ? regimenSub(inputs.spot, inputs.gammaFlip, regimen)
+          : REGIMEN_FRAGMENTS[regimen].sub,
     },
     {
       dimension: 'sesgo',

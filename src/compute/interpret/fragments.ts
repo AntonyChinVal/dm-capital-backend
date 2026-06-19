@@ -17,27 +17,27 @@ export interface Fragment {
 export const REGIMEN_FRAGMENTS: Record<RegimenState, Fragment> = {
   positive_amplio: {
     label: 'Positive gamma',
-    sub: 'Spot well above the flip — moves dampened.',
+    sub: 'Spot well above the flip — settled band.',
   },
   positive_ajustado: {
     label: 'Positive gamma',
-    sub: 'Narrow buffer over the flip — watch direction.',
+    sub: 'Spot above the flip — transition band.',
   },
   positive_critico: {
     label: 'Positive gamma',
-    sub: 'Spot pinned to the flip — regime change is close.',
+    sub: 'Spot near the gamma flip.',
   },
   negative_critico: {
     label: 'Negative gamma',
-    sub: 'Spot pinned to the flip — moves amplified, executions accelerate.',
+    sub: 'Spot near the gamma flip.',
   },
   negative_ajustado: {
     label: 'Negative gamma',
-    sub: 'Spot below the flip — hedging flow biased one way.',
+    sub: 'Spot below the flip — transition band.',
   },
   negative_amplio: {
     label: 'Negative gamma',
-    sub: 'Spot well below the flip — regime is settled.',
+    sub: 'Spot well below the flip — settled band.',
   },
   unknown: {
     label: 'Calculating',
@@ -98,21 +98,38 @@ export const NETFLOW_FRAGMENTS: Record<NetFlowState, Fragment> = {
 export const RANGETREND_FRAGMENTS: Record<RangeTrendState, Fragment> = {
   range: {
     label: 'Range',
-    sub: 'Spot between the walls — mean-reversion pressure.',
+    sub: 'Spot between the walls — mid-corridor.',
   },
   'trend-up': {
     label: 'Trending up',
-    sub: 'Spot near the call wall — resistance ahead.',
+    sub: 'Spot near the call wall.',
   },
   'trend-down': {
     label: 'Trending down',
-    sub: 'Spot near the put wall — support ahead.',
+    sub: 'Spot near the put wall.',
   },
   unknown: {
     label: 'Calculating',
     sub: 'Waiting for call wall and put wall.',
   },
 };
+
+/** Distance-aware regime subtext (descriptive only). */
+export function regimenSub(spot: number, flip: number, state: RegimenState): string {
+  const distPct = ((spot - flip) / spot) * 100;
+  const sign = distPct >= 0 ? '+' : '';
+  const dir = distPct >= 0 ? 'above' : 'below';
+  const dist = `${sign}${distPct.toFixed(1)}% ${dir} the gamma flip`;
+  const signLabel = state.startsWith('positive') ? 'positive' : 'negative';
+
+  if (state.endsWith('_amplio')) {
+    return `Spot ${dist} — settled ${signLabel} gamma band.`;
+  }
+  if (state.endsWith('_ajustado')) {
+    return `Spot ${dist} — transition band.`;
+  }
+  return `Spot ${dist} — near the gamma flip.`;
+}
 
 export type Severity = 'info' | 'warn' | 'critical' | 'unknown';
 

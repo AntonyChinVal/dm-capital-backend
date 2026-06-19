@@ -141,11 +141,29 @@ export function resistanceWall(points: GEXPoint[], refPrice: number): number | n
   return w.strike;
 }
 
-/** Local support — max put GEX below ref price (per expiry). */
-export function supportWall(points: GEXPoint[], refPrice: number): number | null {
+/** Local support — max put GEX below ref price (per expiry). Daily expiries tie-break by put OI. */
+export function supportWall(
+  points: GEXPoint[],
+  refPrice: number,
+  putOiByStrike?: Map<number, number>,
+): number | null {
   if (!points.length || refPrice <= 0) return null;
-  const below = points.filter((p) => p.strike < refPrice && p.putGex > 0);
+  const below = points.filter(
+    (p) =>
+      p.strike < refPrice &&
+      (p.putGex > 0 || (putOiByStrike?.get(p.strike) ?? 0) > 0),
+  );
   if (!below.length) return null;
+
+  if (putOiByStrike?.size) {
+    return below.reduce((a, b) => {
+      const oiA = putOiByStrike.get(a.strike) ?? 0;
+      const oiB = putOiByStrike.get(b.strike) ?? 0;
+      if (oiB !== oiA) return oiB > oiA ? b : a;
+      return b.putGex > a.putGex ? b : a;
+    }).strike;
+  }
+
   const w = below.reduce((a, b) => (b.putGex > a.putGex ? b : a));
   return w.strike;
 }
