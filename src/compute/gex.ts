@@ -141,31 +141,51 @@ export function resistanceWall(points: GEXPoint[], refPrice: number): number | n
   return w.strike;
 }
 
-/** Local support — max put GEX below ref price (per expiry). Daily expiries tie-break by put OI. */
+export interface PutSideWallOpts {
+  putOiByStrike?: Map<number, number>;
+  putVolumeByStrike?: Map<number, number>;
+}
+
+/**
+ * Put-side wall below ref price: min net GEX (most negative γ−), tie-break higher put OI.
+ * Requires put OI > 0 or put volume > 0 when liquidity maps are provided.
+ */
+export function putSideWall(
+  points: GEXPoint[],
+  refPrice: number,
+  opts?: PutSideWallOpts,
+): number | null {
+  if (!points.length || refPrice <= 0) return null;
+
+  const { putOiByStrike, putVolumeByStrike } = opts ?? {};
+  const hasLiquidityMaps = putOiByStrike != null || putVolumeByStrike != null;
+
+  const below = points.filter((p) => {
+    if (p.strike >= refPrice) return false;
+    if (!hasLiquidityMaps) return p.netGex < 0 || p.putGex > 0;
+    const oi = putOiByStrike?.get(p.strike) ?? 0;
+    const vol = putVolumeByStrike?.get(p.strike) ?? 0;
+    return oi > 0 || vol > 0;
+  });
+  if (!below.length) return null;
+
+  return below.reduce((a, b) => {
+    if (a.netGex !== b.netGex) return a.netGex < b.netGex ? a : b;
+    const oiA = putOiByStrike?.get(a.strike) ?? 0;
+    const oiB = putOiByStrike?.get(b.strike) ?? 0;
+    if (oiB !== oiA) return oiB > oiA ? b : a;
+    return a.putGex > b.putGex ? a : b;
+  }).strike;
+}
+
+/** Local support — put-side wall below ref price (per expiry). */
 export function supportWall(
   points: GEXPoint[],
   refPrice: number,
   putOiByStrike?: Map<number, number>,
+  putVolumeByStrike?: Map<number, number>,
 ): number | null {
-  if (!points.length || refPrice <= 0) return null;
-  const below = points.filter(
-    (p) =>
-      p.strike < refPrice &&
-      (p.putGex > 0 || (putOiByStrike?.get(p.strike) ?? 0) > 0),
-  );
-  if (!below.length) return null;
-
-  if (putOiByStrike?.size) {
-    return below.reduce((a, b) => {
-      const oiA = putOiByStrike.get(a.strike) ?? 0;
-      const oiB = putOiByStrike.get(b.strike) ?? 0;
-      if (oiB !== oiA) return oiB > oiA ? b : a;
-      return b.putGex > a.putGex ? b : a;
-    }).strike;
-  }
-
-  const w = below.reduce((a, b) => (b.putGex > a.putGex ? b : a));
-  return w.strike;
+  return putSideWall(points, refPrice, { putOiByStrike, putVolumeByStrike });
 }
 
 /** Structural call wall — max positive net GEX on the full book. */
@@ -177,11 +197,13 @@ export function structuralCallWall(points: GEXPoint[]): number | null {
   return w.strike;
 }
 
-/** Structural put wall — max put GEX below index spot on the full book. */
-export function structuralPutWall(points: GEXPoint[], refPrice: number): number | null {
-  const below = supportWall(points, refPrice);
-  if (below != null) return below;
-  return putWall(points);
+/** Structural put wall — min net GEX below index spot on the full book. */
+export function structuralPutWall(
+  points: GEXPoint[],
+  refPrice: number,
+  opts?: PutSideWallOpts,
+): number | null {
+  return putSideWall(points, refPrice, opts);
 }
 
 export function totalNetGex(points: GEXPoint[]): number {
@@ -207,7 +229,10 @@ export function regimeReport(
     regime,
     gammaFlip: flip,
     callWall: callWall(points),
-    putWall: putWall(points),
+    putWall:
+      spot != null
+        ? putSideWall(points, spot)
+        : putWall(points),
     netGex: totalNetGex(points),
   };
 }

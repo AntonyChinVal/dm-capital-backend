@@ -12,6 +12,7 @@ import {
 import { filterLiquidStrikes } from './compute/liquidStrikes.js';
 import { filterCurveStrikes } from './compute/curveFilter.js';
 import { buildSurface } from './compute/ivSurface.js';
+import { buildSurfaceByDelta } from './compute/ivSurfaceDelta.js';
 import { atmIv } from './compute/atmIv.js';
 import { classifyExpiration } from './compute/classifyExpiration.js';
 import { expectedMoveBands } from './compute/expectedMove.js';
@@ -681,6 +682,7 @@ app.get('/api/surface', async (req: Request, res: Response) => {
   try {
     const currency = typeof req.query.currency === 'string' ? req.query.currency : 'BTC';
     const tenors = Math.max(2, Math.min(8, Number(req.query.tenors ?? 8)));
+    const axis = req.query.axis === 'delta' ? 'delta' : 'strike';
 
     const data = await fetchBookSummary(currency);
     const allRows = parseBookRows(data);
@@ -693,9 +695,10 @@ app.get('/api/surface', async (req: Request, res: Response) => {
       markIv: r.markIv,
       expiration: r.expiration,
       expirationTimestamp: r.expirationTimestamp,
+      underlyingPrice: r.underlyingPrice,
+      interestRate: r.interestRate,
     }));
 
-    const surface = buildSurface(surfaceInput, tenors);
     const termStructure = buildSkewTermStructure(allRows, {
       maxTenors: 'all',
       excludeZeroDte: true,
@@ -704,21 +707,44 @@ app.get('/api/surface', async (req: Request, res: Response) => {
     // Phase 5: structural-fear rule
     alertStream.push(checkStructuralFear(termStructure));
 
-    res.json({
+    const shared = {
       currency,
       fetchedAt: Date.now(),
+      axis,
+      termStructure,
+      headlineSkew: pickHeadlineSkew(termStructure),
+      headlineSkew30d: pickHeadlineSkew30d(
+        buildSkewTermStructure(allRows, { maxTenors: 'all' }),
+      ),
+    };
+
+    if (axis === 'delta') {
+      const surface = buildSurfaceByDelta(surfaceInput, tenors);
+      res.json({
+        ...shared,
+        deltas: surface.deltas,
+        strikes: [],
+        expirations: surface.rows.map((sr) => ({
+          expiration: sr.expiration,
+          timestamp: sr.expirationTimestamp,
+          tenorDays: sr.tenorDays,
+        })),
+        iv: surface.rows.map((sr) => sr.iv),
+      });
+      return;
+    }
+
+    const surface = buildSurface(surfaceInput, tenors);
+    res.json({
+      ...shared,
       strikes: surface.strikes,
+      deltas: [],
       expirations: surface.rows.map((sr) => ({
         expiration: sr.expiration,
         timestamp: sr.expirationTimestamp,
         tenorDays: sr.tenorDays,
       })),
       iv: surface.rows.map((sr) => sr.iv),
-      termStructure,
-      headlineSkew: pickHeadlineSkew(termStructure),
-      headlineSkew30d: pickHeadlineSkew30d(
-        buildSkewTermStructure(allRows, { maxTenors: 'all' }),
-      ),
     });
   } catch (err) {
     res.status(502).json({ error: err instanceof Error ? err.message : String(err) });

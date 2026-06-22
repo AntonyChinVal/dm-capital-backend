@@ -73,6 +73,11 @@ export function buildSurface(rows: SurfaceInput[], maxTenors = 6, minCoverage = 
   return { strikes, rows: surfaceRows };
 }
 
+/** Fill interior nulls on a surface row via linear interpolation. */
+export function fillSurfaceRowGaps(arr: Array<number | null>): void {
+  fillByLinearInterp(arr);
+}
+
 function fillByLinearInterp(arr: Array<number | null>): void {
   let i = 0;
   while (i < arr.length) {

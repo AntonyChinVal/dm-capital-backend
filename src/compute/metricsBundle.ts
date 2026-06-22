@@ -10,8 +10,7 @@ import {
   regimeReport,
   resistanceWall,
   structuralCallWall,
-  structuralPutWall,
-  supportWall,
+  putSideWall,
   type GexInput,
   type GexSweepOption,
   type GEXPoint,
@@ -19,7 +18,6 @@ import {
 } from './gex.js';
 import { atmIv } from './atmIv.js';
 import { expectedMoveBands } from './expectedMove.js';
-import { classifyExpiration } from './classifyExpiration.js';
 import { skew25d } from './skew.js';
 import { getGreeks } from '../state/greeks.js';
 
@@ -164,19 +162,25 @@ function toSweepOptions(rows: ParsedOptionRow[], now = Date.now()): GexSweepOpti
     }));
 }
 
-function buildPutOiMap(rows: ParsedOptionRow[]): Map<number, number> {
-  const m = new Map<number, number>();
+function buildPutLiquidityMaps(rows: ParsedOptionRow[]): {
+  putOiByStrike: Map<number, number>;
+  putVolumeByStrike: Map<number, number>;
+} {
+  const putOiByStrike = new Map<number, number>();
+  const putVolumeByStrike = new Map<number, number>();
   for (const r of rows) {
-    if (r.type === 'P') m.set(r.strike, (m.get(r.strike) ?? 0) + r.openInterest);
+    if (r.type !== 'P') continue;
+    putOiByStrike.set(r.strike, (putOiByStrike.get(r.strike) ?? 0) + r.openInterest);
+    putVolumeByStrike.set(r.strike, (putVolumeByStrike.get(r.strike) ?? 0) + (r.volume ?? 0));
   }
-  return m;
+  return { putOiByStrike, putVolumeByStrike };
 }
 
 function computeScopeLevels(
   liquidRows: ParsedOptionRow[],
   refSpot: number,
   wallRefPrice: number,
-  opts?: { putOiByStrike?: Map<number, number> },
+  opts?: { putOiByStrike?: Map<number, number>; putVolumeByStrike?: Map<number, number> },
   now = Date.now(),
 ): {
   gex: GEXPoint[];
@@ -198,16 +202,21 @@ function computeScopeLevels(
   const gex = gexByStrike(gexRows, refPrice);
   const sweep = toSweepOptions(liquidRows, now);
   const levels = regimeReport(gex, refSpot, sweep);
+  const putSideOpts = opts
+    ? { putOiByStrike: opts.putOiByStrike, putVolumeByStrike: opts.putVolumeByStrike }
+    : undefined;
+  const structuralPut = putSideWall(gex, refSpot, putSideOpts);
+  const support = putSideWall(gex, wallRefPrice, putSideOpts);
   return {
     gex,
     gexCovered: gexRows.length,
     gammaFlip: levels.gammaFlip,
     callWall: levels.callWall,
-    putWall: levels.putWall,
+    putWall: structuralPut,
     resistance: resistanceWall(gex, wallRefPrice),
-    support: supportWall(gex, wallRefPrice, opts?.putOiByStrike),
+    support,
     structuralCall: structuralCallWall(gex),
-    structuralPut: structuralPutWall(gex, refSpot),
+    structuralPut,
     regime: levels.regime,
     netGex: levels.netGex,
   };
@@ -228,19 +237,20 @@ export function computeMetricsBundle(
   const liquidBook = filterLiquidStrikes(allRows);
 
   const scopeRows = scope === 'market' ? liquidBook : liquidExp;
-  const scopeLevels = computeScopeLevels(scopeRows, spotPrice, future, undefined, now);
+  const macroLiquidity = buildPutLiquidityMaps(liquidBook);
+  const localLiquidity = buildPutLiquidityMaps(liquidExp);
 
-  const liquidMacro = filterLiquidStrikes(allRows);
-  const macroLevels = computeScopeLevels(liquidMacro, spotPrice, spotPrice, undefined, now);
-  const isDaily = classifyExpiration(expRows[0].expirationTimestamp) === 'D';
-  const localPutOi = isDaily ? buildPutOiMap(liquidExp) : undefined;
-  const localLevels = computeScopeLevels(
-    liquidExp,
+  const scopeLevels = computeScopeLevels(
+    scopeRows,
     spotPrice,
     future,
-    localPutOi ? { putOiByStrike: localPutOi } : undefined,
+    scope === 'market' ? macroLiquidity : localLiquidity,
     now,
   );
+
+  const liquidMacro = filterLiquidStrikes(allRows);
+  const macroLevels = computeScopeLevels(liquidMacro, spotPrice, spotPrice, macroLiquidity, now);
+  const localLevels = computeScopeLevels(liquidExp, spotPrice, future, localLiquidity, now);
 
   const scopeCallWall =
     scope === 'market' ? macroLevels.structuralCall : localLevels.resistance;

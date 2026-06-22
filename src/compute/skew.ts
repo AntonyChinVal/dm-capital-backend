@@ -19,7 +19,7 @@ export interface SkewResult {
   putStrike?: number;
 }
 
-function ivAtDelta(
+export function interpolateIvAtDelta(
   series: Array<{ delta: number; iv: number }>,
   target: number,
 ): number | null {
@@ -53,8 +53,8 @@ export function skew25d(rows: SkewInput[]): SkewResult {
   calls.sort((a, b) => a.delta - b.delta);
   puts.sort((a, b) => a.delta - b.delta);
 
-  const callIv = ivAtDelta(calls, 0.25);
-  const putIv = ivAtDelta(puts, -0.25);
+  const callIv = interpolateIvAtDelta(calls, 0.25);
+  const putIv = interpolateIvAtDelta(puts, -0.25);
   if (callIv == null || putIv == null) return { skew25d: null };
 
   return {
