@@ -1,14 +1,17 @@
 import { deltaB76 } from './black76.js';
 import { interpolateIvAtDelta } from './skew.js';
-import { fillSurfaceRowGaps } from './ivSurface.js';
 
-/** Delta grid Q12-A: −0.50…−0.05 · gap ATM · +0.05…+0.50 (step 0.05). */
-export const SURFACE_DELTA_GRID: number[] = (() => {
-  const grid: number[] = [];
-  for (let i = -50; i <= -5; i += 5) grid.push(i / 100);
-  for (let i = 5; i <= 50; i += 5) grid.push(i / 100);
-  return grid;
-})();
+/** Put wing targets: OTM (−0.05) → ATM side (−0.50). */
+const PUT_WING_DELTAS = [-0.05, -0.1, -0.15, -0.2, -0.25, -0.3, -0.35, -0.4, -0.45, -0.5] as const;
+/** Call wing targets: ATM side (+0.50) → OTM (+0.05). */
+const CALL_WING_DELTAS = [0.5, 0.45, 0.4, 0.35, 0.3, 0.25, 0.2, 0.15, 0.1, 0.05] as const;
+
+export interface DeltaColumn {
+  index: number;
+  rawDelta: number | null;
+  label: string;
+  hoverLabel: string;
+}
 
 export interface SurfaceDeltaInput {
   strike: number;
@@ -28,7 +31,7 @@ export interface SurfaceDeltaRow {
 }
 
 export interface SurfaceDelta {
-  deltas: number[];
+  columns: DeltaColumn[];
   rows: SurfaceDeltaRow[];
 }
 
@@ -37,6 +40,34 @@ const MIN_ABS_DELTA = 0.05;
 function tenorYears(expirationTimestamp: number, now: number): number {
   return Math.max(1 / (365 * 24 * 3600), (expirationTimestamp - now) / (365 * 24 * 3600 * 1000));
 }
+
+function formatRawDelta(delta: number): string {
+  const abs = Math.abs(delta).toFixed(2);
+  if (delta < 0) return `δ −${abs}`;
+  if (delta > 0) return `δ +${abs}`;
+  return 'δ 0.00';
+}
+
+function buildDeltaColumns(): DeltaColumn[] {
+  const cols: DeltaColumn[] = [];
+  let idx = 0;
+
+  for (const d of PUT_WING_DELTAS) {
+    const label = `${Math.round(Math.abs(d) * 100)}Δ put`;
+    cols.push({ index: idx++, rawDelta: d, label, hoverLabel: `${label} (${formatRawDelta(d)})` });
+  }
+
+  cols.push({ index: idx++, rawDelta: null, label: 'ATM', hoverLabel: 'ATM' });
+
+  for (const d of CALL_WING_DELTAS) {
+    const label = `${Math.round(d * 100)}Δ call`;
+    cols.push({ index: idx++, rawDelta: d, label, hoverLabel: `${label} (${formatRawDelta(d)})` });
+  }
+
+  return cols;
+}
+
+export const SURFACE_DELTA_COLUMNS = buildDeltaColumns();
 
 function deltaIvSeries(
   rows: SurfaceDeltaInput[],
@@ -56,8 +87,16 @@ function deltaIvSeries(
   return series;
 }
 
+function avgIv(a: number | null, b: number | null): number | null {
+  if (a != null && b != null) return (a + b) / 2;
+  if (a != null) return a;
+  if (b != null) return b;
+  return null;
+}
+
 /**
- * IV surface on a fixed delta grid per expiration (Black-76 delta interpolation).
+ * IV surface on a fixed moneyness-ordered delta grid per expiration (Black-76).
+ * 21 columns: 10 put wing · ATM · 10 call wing. No gap-fill — nulls stay masked.
  */
 export function buildSurfaceByDelta(rows: SurfaceDeltaInput[], maxTenors = 8): SurfaceDelta {
   const byExp = new Map<string, { ts: number; rows: SurfaceDeltaInput[] }>();
@@ -75,7 +114,7 @@ export function buildSurfaceByDelta(rows: SurfaceDeltaInput[], maxTenors = 8): S
     .slice(0, maxTenors);
 
   const now = Date.now();
-  const deltas = SURFACE_DELTA_GRID;
+  const columns = SURFACE_DELTA_COLUMNS;
 
   const surfaceRows: SurfaceDeltaRow[] = sortedExp.map(([expiration, bucket]) => {
     const F = bucket.rows.find((r) => r.underlyingPrice > 0)?.underlyingPrice ?? 0;
@@ -84,12 +123,13 @@ export function buildSurfaceByDelta(rows: SurfaceDeltaInput[], maxTenors = 8): S
     const calls = deltaIvSeries(bucket.rows, 'C', F, T, r);
     const puts = deltaIvSeries(bucket.rows, 'P', F, T, r);
 
-    const iv = deltas.map((target) => {
-      if (target < 0) return interpolateIvAtDelta(puts, target);
-      if (target > 0) return interpolateIvAtDelta(calls, target);
-      return null;
-    });
-    fillSurfaceRowGaps(iv);
+    const putWing = PUT_WING_DELTAS.map((target) => interpolateIvAtDelta(puts, target));
+    const atmPut = interpolateIvAtDelta(puts, -0.5);
+    const atmCall = interpolateIvAtDelta(calls, 0.5);
+    const atm = avgIv(atmPut, atmCall);
+    const callWing = CALL_WING_DELTAS.map((target) => interpolateIvAtDelta(calls, target));
+
+    const iv = [...putWing, atm, ...callWing];
 
     return {
       expiration,
@@ -99,5 +139,5 @@ export function buildSurfaceByDelta(rows: SurfaceDeltaInput[], maxTenors = 8): S
     };
   });
 
-  return { deltas, rows: surfaceRows };
+  return { columns, rows: surfaceRows };
 }

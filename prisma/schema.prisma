@@ -97,3 +97,12 @@ model IndexTick {
 
   @@index([indexName, ts])
 }
+
+model DvolTick {
+  ts       DateTime
+  currency String   @default("BTC")
+  value    Float
+
+  @@id([ts, currency])
+  @@index([currency, ts])
+}
