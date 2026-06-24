@@ -24,6 +24,9 @@ export function interpolateIvAtDelta(
   target: number,
 ): number | null {
   if (series.length < 2) return null;
+  const minD = Math.min(series[0].delta, series[series.length - 1].delta);
+  const maxD = Math.max(series[0].delta, series[series.length - 1].delta);
+  if (target < minD || target > maxD) return null;
   for (let i = 1; i < series.length; i++) {
     const a = series[i - 1];
     const b = series[i];

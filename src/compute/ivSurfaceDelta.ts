@@ -129,7 +129,9 @@ export function buildSurfaceByDelta(rows: SurfaceDeltaInput[], maxTenors = 8): S
     const atm = avgIv(atmPut, atmCall);
     const callWing = CALL_WING_DELTAS.map((target) => interpolateIvAtDelta(calls, target));
 
-    const iv = [...putWing, atm, ...callWing];
+    const iv = [...putWing, atm, ...callWing].map((v) =>
+      v == null || !Number.isFinite(v) || v <= 0 ? null : v,
+    );
 
     return {
       expiration,
