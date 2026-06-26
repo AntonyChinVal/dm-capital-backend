@@ -13,6 +13,7 @@ import {
   resistanceWall,
   structuralCallWall,
   putSideWall,
+  putSideWallStable,
   vexByStrike,
   vexSummary,
   type DEXPoint,
@@ -243,7 +244,12 @@ function computeScopeLevels(
   liquidRows: ParsedOptionRow[],
   refSpot: number,
   wallRefPrice: number,
-  opts?: { putOiByStrike?: Map<number, number>; putVolumeByStrike?: Map<number, number> },
+  opts?: {
+    putOiByStrike?: Map<number, number>;
+    putVolumeByStrike?: Map<number, number>;
+    /** When set, apply cascade hysteresis to the structural put wall (live read path only). */
+    hysteresisKey?: string;
+  },
   now = Date.now(),
 ): {
   gex: GEXPoint[];
@@ -280,7 +286,9 @@ function computeScopeLevels(
   const putSideOpts = opts
     ? { putOiByStrike: opts.putOiByStrike, putVolumeByStrike: opts.putVolumeByStrike }
     : undefined;
-  const structuralPut = putSideWall(gex, refSpot, putSideOpts);
+  const structuralPut = opts?.hysteresisKey
+    ? putSideWallStable(gex, refSpot, opts.hysteresisKey, putSideOpts)
+    : putSideWall(gex, refSpot, putSideOpts);
   const support = putSideWall(gex, wallRefPrice, putSideOpts);
   return {
     gex,
@@ -309,6 +317,14 @@ export function computeMetricsBundle(
   scope: MetricsScope,
   spotPrice: number,
   now = Date.now(),
+  opts?: {
+    /**
+     * Stabilize the macro cascade wall against flicker (Hernán 2026-06-26).
+     * Pass only from the live read path (e.g. 'BTC'); leave undefined for
+     * persistence so snapshot state never contaminates the live hysteresis.
+     */
+    cascadeHysteresisKey?: string;
+  },
 ): MetricsBundle | null {
   const expRows = allRows.filter((r) => r.expiration === expiration);
   if (!expRows.length) return null;
@@ -330,7 +346,15 @@ export function computeMetricsBundle(
   );
 
   const liquidMacro = filterLiquidStrikes(allRows);
-  const macroLevels = computeScopeLevels(liquidMacro, spotPrice, spotPrice, macroLiquidity, now);
+  const macroLevels = computeScopeLevels(
+    liquidMacro,
+    spotPrice,
+    spotPrice,
+    opts?.cascadeHysteresisKey
+      ? { ...macroLiquidity, hysteresisKey: `${opts.cascadeHysteresisKey}:macro-cascade` }
+      : macroLiquidity,
+    now,
+  );
   const localLevels = computeScopeLevels(liquidExp, spotPrice, future, localLiquidity, now);
 
   const scopeCallWall =

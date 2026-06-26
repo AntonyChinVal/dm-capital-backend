@@ -886,6 +886,8 @@ app.get('/api/metrics', async (req: Request, res: Response) => {
       expiration,
       scope,
       indexPrice.index_price,
+      Date.now(),
+      { cascadeHysteresisKey: currency },
     );
     if (!bundle) {
       return res.status(404).json({ error: `no instruments for expiration ${expiration}` });

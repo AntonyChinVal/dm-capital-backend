@@ -279,10 +279,21 @@ export function resistanceWall(points: GEXPoint[], refPrice: number): number | n
 export interface PutSideWallOpts {
   putOiByStrike?: Map<number, number>;
   putVolumeByStrike?: Map<number, number>;
+  /**
+   * Tolerance band above ref price (fraction of refPrice) so a cascade wall
+   * sitting essentially at spot is not dropped when spot dips a few dollars
+   * below the strike. Hernán 2026-06-26: this is the root-cause fix for the
+   * cascade jumping when spot dances across a big strike (e.g. $60k).
+   * Default 0.75% of refPrice.
+   */
+  bufferPct?: number;
 }
 
+const DEFAULT_PUT_WALL_BUFFER_PCT = 0.0075;
+
 /**
- * Put-side wall below ref price: min net GEX (most negative γ−), tie-break higher put OI.
+ * Put-side wall at/below ref price (within a tolerance band): min net GEX
+ * (most negative γ−), tie-break higher put OI.
  * Requires put OI > 0 or put volume > 0 when liquidity maps are provided.
  */
 export function putSideWall(
@@ -294,9 +305,11 @@ export function putSideWall(
 
   const { putOiByStrike, putVolumeByStrike } = opts ?? {};
   const hasLiquidityMaps = putOiByStrike != null || putVolumeByStrike != null;
+  const bufferPct = opts?.bufferPct ?? DEFAULT_PUT_WALL_BUFFER_PCT;
+  const ceiling = refPrice * (1 + bufferPct);
 
   const below = points.filter((p) => {
-    if (p.strike >= refPrice) return false;
+    if (p.strike >= ceiling) return false;
     if (!hasLiquidityMaps) return p.netGex < 0 || p.putGex > 0;
     const oi = putOiByStrike?.get(p.strike) ?? 0;
     const vol = putVolumeByStrike?.get(p.strike) ?? 0;
@@ -311,6 +324,58 @@ export function putSideWall(
     if (oiB !== oiA) return oiB > oiA ? b : a;
     return a.putGex > b.putGex ? a : b;
   }).strike;
+}
+
+/**
+ * Net GEX magnitude at a given strike (for hysteresis margin checks).
+ */
+function netGexAtStrike(points: GEXPoint[], strike: number | null): number {
+  if (strike == null) return 0;
+  const pt = points.find((p) => p.strike === strike);
+  return pt ? Math.abs(pt.netGex) : 0;
+}
+
+interface HysteresisState {
+  strike: number;
+  magnitude: number;
+}
+
+const cascadeHysteresis = new Map<string, HysteresisState>();
+
+/**
+ * Hysteresis refuerzo (Hernán 2026-06-26): keep the current cascade strike
+ * unless a new candidate beats it by `margin` (default 15%). Safety net
+ * against flicker — NOT the root-cause fix (that's the tolerance band).
+ * Stateful per `key` (e.g. currency:expiration:scope); only call from the
+ * live read path, never from persistence to avoid cross-contaminating state.
+ */
+export function putSideWallStable(
+  points: GEXPoint[],
+  refPrice: number,
+  key: string,
+  opts?: PutSideWallOpts & { margin?: number },
+): number | null {
+  const candidate = putSideWall(points, refPrice, opts);
+  if (candidate == null) return null;
+
+  const margin = opts?.margin ?? 0.15;
+  const candidateMag = netGexAtStrike(points, candidate);
+  const prev = cascadeHysteresis.get(key);
+
+  if (prev) {
+    const prevStillValid = points.some((p) => p.strike === prev.strike);
+    if (prevStillValid && candidate !== prev.strike) {
+      const prevMag = netGexAtStrike(points, prev.strike);
+      // Only switch if the new candidate is meaningfully stronger.
+      if (candidateMag <= prevMag * (1 + margin)) {
+        cascadeHysteresis.set(key, { strike: prev.strike, magnitude: prevMag });
+        return prev.strike;
+      }
+    }
+  }
+
+  cascadeHysteresis.set(key, { strike: candidate, magnitude: candidateMag });
+  return candidate;
 }
 
 /** Local support — put-side wall below ref price (per expiry). */

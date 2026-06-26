@@ -70,7 +70,11 @@ export function buildSignalSnapshot(
   const expiration = nearestExpiration(allRows);
   if (!expiration) return null;
 
-  const bundle = computeMetricsBundle(allRows, expiration, 'market', spot, now);
+  // Separate hysteresis namespace from the live read path: persistence runs on
+  // its own cadence and must not contaminate (or be contaminated by) live state.
+  const bundle = computeMetricsBundle(allRows, expiration, 'market', spot, now, {
+    cascadeHysteresisKey: 'persist:BTC',
+  });
   if (!bundle) return null;
 
   const term = buildSkewTermStructure(allRows, {
