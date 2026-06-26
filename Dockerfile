@@ -24,6 +24,8 @@ RUN pnpm install --frozen-lockfile
 # Source + build
 COPY tsconfig.json ./
 COPY src ./src
+COPY docker-start.sh ./
+RUN chmod +x docker-start.sh
 RUN DATABASE_URL_DURABLE="postgresql://user:pass@localhost:5432/dm_capital?sslmode=require" \
     DIRECT_URL_DURABLE="postgresql://user:pass@localhost:5432/dm_capital?sslmode=require" \
     pnpm prisma:generate:all
@@ -39,6 +41,6 @@ ENV NODE_ENV=production \
 
 EXPOSE 4000
 
-# Apply pending local SQLite migrations, then start the service.
+# Apply pending local SQLite migrations (self-healing), then start the service.
 # Durable Neon migrations are run explicitly via pnpm prisma:deploy:durable.
-CMD ["sh", "-c", "pnpm prisma:deploy:local && node dist/index.js"]
+CMD ["./docker-start.sh"]
