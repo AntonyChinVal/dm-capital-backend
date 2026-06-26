@@ -24,7 +24,9 @@ RUN pnpm install --frozen-lockfile
 # Source + build
 COPY tsconfig.json ./
 COPY src ./src
-RUN pnpm prisma generate
+RUN DATABASE_URL_DURABLE="postgresql://user:pass@localhost:5432/dm_capital?sslmode=require" \
+    DIRECT_URL_DURABLE="postgresql://user:pass@localhost:5432/dm_capital?sslmode=require" \
+    pnpm prisma:generate:all
 RUN pnpm build
 
 # Volume mount target
@@ -37,5 +39,6 @@ ENV NODE_ENV=production \
 
 EXPOSE 4000
 
-# Apply any pending Prisma migrations, then start the server.
-CMD ["sh", "-c", "pnpm prisma migrate deploy && node dist/index.js"]
+# Apply pending local SQLite migrations, then start the service.
+# Durable Neon migrations are run explicitly via pnpm prisma:deploy:durable.
+CMD ["sh", "-c", "pnpm prisma:deploy:local && node dist/index.js"]

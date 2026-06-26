@@ -106,3 +106,15 @@ model DvolTick {
   @@id([ts, currency])
   @@index([currency, ts])
 }
+
+model DurableOutbox {
+  id        String   @id
+  kind      String
+  payload   String
+  createdAt DateTime @default(now())
+  attempts  Int      @default(0)
+  lastError String?
+
+  @@index([kind, createdAt])
+  @@index([createdAt])
+}

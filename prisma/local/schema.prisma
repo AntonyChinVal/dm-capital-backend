@@ -1,0 +1,29 @@
+// DM Capital — local cache schema
+// SQLite stays local and bounded: restart-recovery + short-lived outbox only.
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../../src/generated/local-client"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model FlowAggregateSnapshot {
+  ts      DateTime @id
+  buckets String
+}
+
+model DurableOutbox {
+  id        String   @id
+  kind      String
+  payload   String
+  createdAt DateTime @default(now())
+  attempts  Int      @default(0)
+  lastError String?
+
+  @@index([kind, createdAt])
+  @@index([createdAt])
+}

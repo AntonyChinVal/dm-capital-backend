@@ -15,3 +15,6 @@ data/**/*.db-journal
 prisma/data/
 *.db
 *.db-journal
+
+# Generated Prisma clients (created by pnpm prisma:generate:all)
+src/generated/

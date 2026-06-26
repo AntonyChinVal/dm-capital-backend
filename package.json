@@ -14,7 +14,14 @@
     "audit:snapshot": "tsx scripts/audit-snapshot.ts",
     "prisma:dev": "prisma migrate dev",
     "prisma:deploy": "prisma migrate deploy",
-    "prisma:studio": "prisma studio"
+    "prisma:studio": "prisma studio",
+    "prisma:generate:legacy": "prisma generate --schema prisma/schema.prisma",
+    "prisma:generate:local": "prisma generate --schema prisma/local/schema.prisma",
+    "prisma:generate:durable": "prisma generate --schema prisma/durable/schema.prisma",
+    "prisma:generate:all": "pnpm prisma:generate:legacy && pnpm prisma:generate:local && pnpm prisma:generate:durable",
+    "prisma:deploy:local": "prisma migrate deploy --schema prisma/schema.prisma",
+    "prisma:deploy:durable": "prisma migrate deploy --schema prisma/durable/schema.prisma",
+    "prisma:studio:durable": "prisma studio --schema prisma/durable/schema.prisma"
   },
   "dependencies": {
     "@prisma/client": "^5.20.0",

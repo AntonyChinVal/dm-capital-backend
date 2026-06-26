@@ -1,4 +1,5 @@
 import { prisma } from '../db.js';
+import { enqueueDvolTick } from './durableBatcher.js';
 import type { Alert } from '../compute/signals.js';
 import type { FlowEvent } from '../compute/tradeFlow.js';
 import type { GEXPoint } from '../compute/gex.js';
@@ -127,13 +128,7 @@ export function persistIndexTick(price: number, indexName = 'btc_usd', ts = new 
 }
 
 export function persistDvolTick(value: number, currency = 'BTC', ts = new Date()): void {
-  if (!Number.isFinite(value) || value <= 0) return;
-  const minute = new Date(Math.floor(ts.getTime() / 60_000) * 60_000);
-  prisma.dvolTick.upsert({
-    where: { ts_currency: { ts: minute, currency } },
-    create: { ts: minute, currency, value },
-    update: { value },
-  }).catch(logErr('dvolTick'));
+  enqueueDvolTick(value, currency, ts);
 }
 
 export function persistAggregateSnapshot(buckets: Map<number, unknown>): void {

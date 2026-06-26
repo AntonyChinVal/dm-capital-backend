@@ -1,6 +1,7 @@
 import express, { type Request, type Response } from 'express';
 import cors from 'cors';
 import { prisma } from './db.js';
+import { durablePrisma } from './db/durable.js';
 import { fetchBookSummary, fetchDvolLatest, fetchIndexPrice } from './deribit/rest.js';
 import { DeribitWS } from './deribit/ws.js';
 import { parseInstrument } from './compute/parseInstrument.js';
@@ -28,8 +29,10 @@ import {
 import { classifyTrade, type DeribitTrade } from './compute/tradeFlow.js';
 import { flowAggregator } from './state/aggregator.js';
 import { alertStream } from './state/alerts.js';
+import { getDurableStatus, startDurableBatcher } from './state/durableBatcher.js';
 import { getDvol, updateDvol } from './state/dvol.js';
 import { getGreeks, greeksCount, greeksWithGamma, updateGreeks } from './state/greeks.js';
+import { persistSignalSnapshot } from './state/signalSnapshot.js';
 import { tradeStream } from './state/trades.js';
 import {
   persistAggregateSnapshot,
@@ -134,6 +137,7 @@ async function refreshSubscriptions(): Promise<void> {
 
 app.get('/api/health', (_req: Request, res: Response) => {
   const dvol = getDvol('btc_usd');
+  const durable = getDurableStatus();
   res.json({
     ok: true,
     ts: Date.now(),
@@ -146,6 +150,14 @@ app.get('/api/health', (_req: Request, res: Response) => {
     aggregatorBuckets: flowAggregator.size(),
     dvol: dvol?.value ?? null,
     dvolAge: dvol ? Date.now() - dvol.ts : null,
+    durableDb: durable.durableDb,
+    localDb: durable.localDb,
+    pendingOutbox: durable.pendingOutbox,
+    lastDvolWrite: durable.lastDvolWrite,
+    lastSignalWrite: durable.lastSignalWrite,
+    lastDurableFlushAt: durable.lastFlushAt,
+    durableFlushIntervalMs: durable.flushIntervalMs,
+    durableError: durable.lastFlushError,
   });
 });
 
@@ -444,7 +456,7 @@ app.get('/api/dvol/history', async (req: Request, res: Response) => {
     const currency = typeof req.query.currency === 'string' ? req.query.currency : 'BTC';
     const since = new Date(Date.now() - windowMs);
 
-    const rows = await prisma.dvolTick.findMany({
+    const rows = await durablePrisma.dvolTick.findMany({
       where: { currency, ts: { gte: since } },
       orderBy: { ts: 'asc' },
       select: { ts: true, value: true },
@@ -933,11 +945,23 @@ async function snapshotDvolTick(): Promise<void> {
   persistDvolTick(snap.value, 'BTC', new Date(snap.ts));
 }
 
+async function snapshotSignal(): Promise<void> {
+  try {
+    const [data, indexPrice] = await Promise.all([
+      fetchBookSummary('BTC'),
+      fetchIndexPrice('btc_usd'),
+    ]);
+    persistSignalSnapshot(data, indexPrice.index_price);
+  } catch (err) {
+    console.error('[persist] signal snapshot failed', err);
+  }
+}
+
 async function pruneOldHistory(): Promise<void> {
   const cutoff = new Date(Date.now() - RETENTION_DAYS * 86_400_000);
   const dvolCutoff = new Date(Date.now() - DVOL_RETENTION_DAYS * 86_400_000);
   try {
-    const [metrics, surface, trades, alerts, ticks, aggs, dvol] = await Promise.all([
+    const [metrics, surface, trades, alerts, ticks, aggs, legacyDvol, durableDvol] = await Promise.all([
       prisma.metricSnapshot.deleteMany({ where: { ts: { lt: cutoff } } }),
       prisma.surfaceSnapshot.deleteMany({ where: { ts: { lt: cutoff } } }),
       prisma.flowTrade.deleteMany({ where: { ts: { lt: cutoff } } }),
@@ -945,9 +969,10 @@ async function pruneOldHistory(): Promise<void> {
       prisma.indexTick.deleteMany({ where: { ts: { lt: cutoff } } }),
       prisma.flowAggregateSnapshot.deleteMany({ where: { ts: { lt: cutoff } } }),
       prisma.dvolTick.deleteMany({ where: { ts: { lt: dvolCutoff } } }),
+      durablePrisma.dvolTick.deleteMany({ where: { ts: { lt: dvolCutoff } } }),
     ]);
     console.log(
-      `[persist] pruned ${RETENTION_DAYS}d cutoff: metrics=${metrics.count} surface=${surface.count} trades=${trades.count} alerts=${alerts.count} ticks=${ticks.count} aggs=${aggs.count} · dvol ${DVOL_RETENTION_DAYS}d=${dvol.count}`,
+      `[persist] pruned ${RETENTION_DAYS}d cutoff: metrics=${metrics.count} surface=${surface.count} trades=${trades.count} alerts=${alerts.count} ticks=${ticks.count} aggs=${aggs.count} · legacy dvol ${DVOL_RETENTION_DAYS}d=${legacyDvol.count} durable dvol=${durableDvol.count}`,
     );
   } catch (err) {
     console.error('[persist] prune failed', err);
@@ -955,6 +980,8 @@ async function pruneOldHistory(): Promise<void> {
 }
 
 function startPersistenceTimers(): void {
+  startDurableBatcher();
+
   // IndexTick — every 30s (D11.1 audit grain)
   setInterval(snapshotIndexTick, 30_000);
   snapshotIndexTick();
@@ -974,9 +1001,13 @@ function startPersistenceTimers(): void {
   setInterval(snapshotDvolTick, 60_000);
   setTimeout(snapshotDvolTick, 5_000);
 
+  // SignalSnapshot — every 60s capture, durable flush is batched separately.
+  setInterval(snapshotSignal, 60_000);
+  setTimeout(snapshotSignal, 20_000);
+
   // Prune retention — daily
   setInterval(pruneOldHistory, 24 * 60 * 60_000);
   setTimeout(pruneOldHistory, 60_000);
 
-  console.log('[persist] timers started: indexTick=30s · dvol=60s · metric/surface=5m · aggregate=60s · prune=24h');
+  console.log('[persist] timers started: indexTick=30s · dvol=60s · signal=60s · metric/surface=5m · aggregate=60s · prune=24h');
 }

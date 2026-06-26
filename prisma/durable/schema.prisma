@@ -1,0 +1,161 @@
+// DM Capital — durable persistence schema
+// Neon Postgres stores historical data, rank series, and the Fase H dataset.
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../../src/generated/durable-client"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL_DURABLE")
+  directUrl = env("DIRECT_URL_DURABLE")
+}
+
+model MetricSnapshot {
+  id          Int      @id @default(autoincrement())
+  ts          DateTime
+  currency    String   @default("BTC")
+  expiration  String
+
+  future      Float
+  maxPain     Float?
+  gammaFlip   Float?
+  callWall    Float?
+  putWall     Float?
+
+  regime      String
+  oiSummary   Json
+  gexSummary  Json
+  atmIv       Float?
+  count       Int
+  gexCovered  Int
+
+  @@index([currency, expiration, ts])
+  @@index([ts])
+}
+
+model SurfaceSnapshot {
+  id            Int      @id @default(autoincrement())
+  ts            DateTime
+  currency      String   @default("BTC")
+  headlineSkew  Float?
+  termStructure Json
+
+  @@index([currency, ts])
+}
+
+model FlowTrade {
+  id             String   @id
+  ts             DateTime
+  expiration     String
+  strike         Float
+  type           String
+  side           String
+  tag            String
+  amount         Float
+  notionalUsd    Float
+  signedNotional Float
+  iv             Float?
+  priorIv        Float?
+  ivDelta        Float?
+  interp         String
+
+  @@index([ts])
+  @@index([expiration, ts])
+  @@index([tag, ts])
+}
+
+model AlertLog {
+  id          String   @id
+  firstSeen   DateTime
+  kind        String
+  severity    String
+  title       String
+  message     String
+  contextJson Json?
+
+  @@index([firstSeen])
+  @@index([kind, severity])
+}
+
+model IndexTick {
+  ts        DateTime
+  indexName String   @default("btc_usd")
+  price     Float
+
+  @@id([ts, indexName])
+  @@index([indexName, ts])
+}
+
+model DvolTick {
+  ts       DateTime
+  currency String   @default("BTC")
+  value    Float
+
+  @@id([ts, currency])
+  @@index([currency, ts])
+}
+
+model SignalSnapshot {
+  /// Schema contract version for backtest compatibility.
+  schemaVersion  Int      @default(1)
+  /// UTC timestamp of the terminal snapshot, truncated to the minute.
+  ts             DateTime @db.Timestamptz(3)
+  currency       String   @default("BTC")
+
+  /// Unit: USD spot/index price shown by the terminal.
+  spot           Float?
+  /// Unit: volatility index percent, e.g. 46.3 means 46.3%.
+  dvol           Float?
+
+  /// Unit: vol percentage-point skew at constant 7D maturity.
+  skew7d         Float?
+  /// Unit: vol percentage-point skew at constant 30D maturity.
+  skew30d        Float?
+  /// Unit: vol percentage-point skew at constant 90D maturity.
+  skew90d        Float?
+  /// Unit: vol percentage-point skew at constant 180D maturity.
+  skew180d       Float?
+
+  /// Unit: USD gamma exposure per 1% move.
+  gexNet         Float?
+  /// Unit: USD strike level where net gamma flips sign.
+  gammaFlip      Float?
+  /// Unit: USD strike level of strongest positive GEX / call wall.
+  callWall       Float?
+  /// Unit: USD strike level of most negative GEX / put-heavy cascade wall below spot.
+  cascadeWall    Float?
+
+  /// Unit: USD delta notional. NULL until DEX exists; 0 means measured neutral.
+  dexNet         Float?
+  /// Unit: USD notional, delta-weighted flow. NULL until measured.
+  flowDeltaNet   Float?
+  /// Unit: USD notional, vega-weighted flow. NULL until measured.
+  flowVegaNet    Float?
+  /// Unit: USD premium/notional flow. NULL until measured.
+  flowPremiumNet Float?
+
+  /// Regime label displayed by the terminal. NULL until rules exist.
+  regimeLabel    String?
+
+  @@id([ts, currency])
+  @@index([currency, ts])
+}
+
+model SignalStrikeSnapshot {
+  /// Schema contract version for backtest compatibility.
+  schemaVersion Int      @default(1)
+  /// UTC timestamp of this strike-level snapshot.
+  ts            DateTime @db.Timestamptz(3)
+  currency      String   @default("BTC")
+  /// Payload family, e.g. gex_by_strike, dex_by_strike, oi_by_strike.
+  kind          String
+  /// Intended write cadence in minutes, usually 5-15.
+  cadenceMinutes Int
+  /// Unit: JSON arrays by strike; never raw Deribit option-chain dump.
+  payload       Json
+
+  @@id([ts, currency, kind])
+  @@index([currency, kind, ts])
+}
