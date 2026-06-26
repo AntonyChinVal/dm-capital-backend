@@ -289,7 +289,7 @@ app.get('/api/history/metrics', async (req: Request, res: Response) => {
     const hours = Number.isFinite(hoursParam) ? Math.max(1, Math.min(720, hoursParam)) : 6;
     const since = new Date(Date.now() - hours * 60 * 60_000);
 
-    const rows = await prisma.metricSnapshot.findMany({
+    const rows = await durablePrisma.metricSnapshot.findMany({
       where: { currency, expiration, ts: { gte: since } },
       orderBy: { ts: 'asc' },
       select: {
@@ -340,7 +340,7 @@ app.get('/api/history/index', async (req: Request, res: Response) => {
     const hoursParam = Number(req.query.hours ?? 6);
     const hours = Number.isFinite(hoursParam) ? Math.max(1, Math.min(720, hoursParam)) : 6;
     const since = new Date(Date.now() - hours * 60 * 60_000);
-    const rows = await prisma.indexTick.findMany({
+    const rows = await durablePrisma.indexTick.findMany({
       where: { indexName, ts: { gte: since } },
       orderBy: { ts: 'asc' },
       select: { ts: true, price: true },
@@ -361,7 +361,7 @@ app.get('/api/history/export/flow.csv', async (req: Request, res: Response) => {
     const hours = Number.isFinite(hoursParam) ? Math.max(1, Math.min(720, hoursParam)) : 24;
     const since = new Date(Date.now() - hours * 60 * 60_000);
 
-    const rows = await prisma.flowTrade.findMany({
+    const rows = await durablePrisma.flowTrade.findMany({
       where: { ts: { gte: since } },
       orderBy: { ts: 'asc' },
     });
@@ -407,7 +407,7 @@ app.get('/api/history/alerts', async (req: Request, res: Response) => {
     const hoursParam = Number(req.query.hours ?? 24);
     const hours = Number.isFinite(hoursParam) ? Math.max(1, Math.min(720, hoursParam)) : 24;
     const since = new Date(Date.now() - hours * 60 * 60_000);
-    const rows = await prisma.alertLog.findMany({
+    const rows = await durablePrisma.alertLog.findMany({
       where: { firstSeen: { gte: since } },
       orderBy: { firstSeen: 'desc' },
       take: 200,
@@ -986,6 +986,7 @@ app.listen(PORT, HOST, async () => {
 
 const RETENTION_DAYS = Number(process.env.HISTORY_RETENTION_DAYS ?? 90);
 const DVOL_RETENTION_DAYS = Number(process.env.DVOL_RETENTION_DAYS ?? 365);
+const FLOW_TRADE_RETENTION_DAYS = Number(process.env.FLOW_TRADE_RETENTION_DAYS ?? 30);
 const FLOW_AGGREGATE_RETENTION_HOURS = Number(process.env.FLOW_AGGREGATE_RETENTION_HOURS ?? 48);
 
 async function snapshotIndexTick(): Promise<void> {
@@ -1076,20 +1077,41 @@ async function snapshotSignal(): Promise<void> {
 async function pruneOldHistory(): Promise<void> {
   const cutoff = new Date(Date.now() - RETENTION_DAYS * 86_400_000);
   const dvolCutoff = new Date(Date.now() - DVOL_RETENTION_DAYS * 86_400_000);
+  const flowTradeCutoff = new Date(Date.now() - FLOW_TRADE_RETENTION_DAYS * 86_400_000);
   const aggregateCutoff = new Date(Date.now() - FLOW_AGGREGATE_RETENTION_HOURS * 60 * 60_000);
   try {
-    const [metrics, surface, trades, alerts, ticks, aggs, legacyDvol, durableDvol] = await Promise.all([
-      prisma.metricSnapshot.deleteMany({ where: { ts: { lt: cutoff } } }),
-      prisma.surfaceSnapshot.deleteMany({ where: { ts: { lt: cutoff } } }),
-      prisma.flowTrade.deleteMany({ where: { ts: { lt: cutoff } } }),
-      prisma.alertLog.deleteMany({ where: { firstSeen: { lt: cutoff } } }),
-      prisma.indexTick.deleteMany({ where: { ts: { lt: cutoff } } }),
+    const [
+      legacyMetrics,
+      legacySurface,
+      legacyTrades,
+      legacyAlerts,
+      legacyTicks,
+      aggs,
+      legacyDvol,
+      durableMetrics,
+      durableSurface,
+      durableTrades,
+      durableAlerts,
+      durableTicks,
+      durableDvol,
+    ] = await Promise.all([
+      // SQLite is now cache/outbox only. Clear legacy historical tables entirely.
+      prisma.metricSnapshot.deleteMany({}),
+      prisma.surfaceSnapshot.deleteMany({}),
+      prisma.flowTrade.deleteMany({}),
+      prisma.alertLog.deleteMany({}),
+      prisma.indexTick.deleteMany({}),
       prisma.flowAggregateSnapshot.deleteMany({ where: { ts: { lt: aggregateCutoff } } }),
-      prisma.dvolTick.deleteMany({ where: { ts: { lt: dvolCutoff } } }),
+      prisma.dvolTick.deleteMany({}),
+      durablePrisma.metricSnapshot.deleteMany({ where: { ts: { lt: cutoff } } }),
+      durablePrisma.surfaceSnapshot.deleteMany({ where: { ts: { lt: cutoff } } }),
+      durablePrisma.flowTrade.deleteMany({ where: { ts: { lt: flowTradeCutoff } } }),
+      durablePrisma.alertLog.deleteMany({ where: { firstSeen: { lt: cutoff } } }),
+      durablePrisma.indexTick.deleteMany({ where: { ts: { lt: cutoff } } }),
       durablePrisma.dvolTick.deleteMany({ where: { ts: { lt: dvolCutoff } } }),
     ]);
     console.log(
-      `[persist] pruned ${RETENTION_DAYS}d cutoff: metrics=${metrics.count} surface=${surface.count} trades=${trades.count} alerts=${alerts.count} ticks=${ticks.count} · aggregate ${FLOW_AGGREGATE_RETENTION_HOURS}h=${aggs.count} · legacy dvol ${DVOL_RETENTION_DAYS}d=${legacyDvol.count} durable dvol=${durableDvol.count}`,
+      `[persist] pruned durable ${RETENTION_DAYS}d: metrics=${durableMetrics.count} surface=${durableSurface.count} alerts=${durableAlerts.count} ticks=${durableTicks.count} · durable flow ${FLOW_TRADE_RETENTION_DAYS}d=${durableTrades.count} · durable dvol ${DVOL_RETENTION_DAYS}d=${durableDvol.count} · sqlite legacy cleared: metrics=${legacyMetrics.count} surface=${legacySurface.count} trades=${legacyTrades.count} alerts=${legacyAlerts.count} ticks=${legacyTicks.count} dvol=${legacyDvol.count} · aggregate ${FLOW_AGGREGATE_RETENTION_HOURS}h=${aggs.count}`,
     );
   } catch (err) {
     console.error('[persist] prune failed', err);
