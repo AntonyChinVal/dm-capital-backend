@@ -57,6 +57,12 @@ app.use(cors());
 
 const dws = new DeribitWS();
 
+// Cheap liveness probe for Fly health checks. Keep this synchronous and
+// independent from DB/disk probes; /api/health remains the richer ops endpoint.
+app.get('/api/live', (_req: Request, res: Response) => {
+  res.json({ ok: true, ts: Date.now() });
+});
+
 dws.onTrade((raw) => {
   const ev = classifyTrade(raw as DeribitTrade);
   if (!ev) return;

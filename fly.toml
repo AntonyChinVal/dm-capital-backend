@@ -33,7 +33,7 @@ primary_region = "gru"        # São Paulo — closest SA region (scl/Santiago d
     timeout      = "5s"
     grace_period = "90s"
     method       = "GET"
-    path         = "/api/health"
+    path         = "/api/live"
 
 [[vm]]
   size   = "shared-cpu-1x"
