@@ -1,5 +1,6 @@
 import express, { type Request, type Response } from 'express';
 import cors from 'cors';
+import { statfs } from 'node:fs/promises';
 import { prisma } from './db.js';
 import { durablePrisma } from './db/durable.js';
 import { fetchBookSummary, fetchDvolLatest, fetchIndexPrice } from './deribit/rest.js';
@@ -48,6 +49,7 @@ const PORT = Number(process.env.PORT ?? 4000);
 const HOST = process.env.HOST ?? '0.0.0.0';
 const FLOW_STREAM_MIN_BTC = Number(process.env.FLOW_STREAM_MIN_BTC ?? 1);
 const FLOW_AGG_MIN_BTC = Number(process.env.FLOW_AGG_MIN_BTC ?? 0.1);
+const DATA_DIR = process.env.DATA_DIR ?? '/data';
 
 const app = express();
 app.use(cors());
@@ -135,9 +137,42 @@ async function refreshSubscriptions(): Promise<void> {
   }
 }
 
-app.get('/api/health', (_req: Request, res: Response) => {
+interface DiskUsage {
+  path: string;
+  totalBytes: number;
+  usedBytes: number;
+  freeBytes: number;
+  usedPercent: number;
+  status: 'ok' | 'warning' | 'critical' | 'unknown';
+  error?: string;
+}
+
+async function getDiskUsage(path: string): Promise<DiskUsage> {
+  try {
+    const stats = await statfs(path);
+    const totalBytes = stats.blocks * stats.bsize;
+    const freeBytes = stats.bavail * stats.bsize;
+    const usedBytes = Math.max(0, totalBytes - freeBytes);
+    const usedPercent = totalBytes > 0 ? Number(((usedBytes / totalBytes) * 100).toFixed(2)) : 0;
+    const status = usedPercent >= 85 ? 'critical' : usedPercent >= 70 ? 'warning' : 'ok';
+    return { path, totalBytes, usedBytes, freeBytes, usedPercent, status };
+  } catch (err) {
+    return {
+      path,
+      totalBytes: 0,
+      usedBytes: 0,
+      freeBytes: 0,
+      usedPercent: 0,
+      status: 'unknown',
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
+app.get('/api/health', async (_req: Request, res: Response) => {
   const dvol = getDvol('btc_usd');
   const durable = getDurableStatus();
+  const dataDisk = await getDiskUsage(DATA_DIR);
   res.json({
     ok: true,
     ts: Date.now(),
@@ -158,6 +193,7 @@ app.get('/api/health', (_req: Request, res: Response) => {
     lastDurableFlushAt: durable.lastFlushAt,
     durableFlushIntervalMs: durable.flushIntervalMs,
     durableError: durable.lastFlushError,
+    dataDisk,
   });
 });
 
@@ -871,6 +907,7 @@ app.listen(PORT, HOST, async () => {
 
 const RETENTION_DAYS = Number(process.env.HISTORY_RETENTION_DAYS ?? 90);
 const DVOL_RETENTION_DAYS = Number(process.env.DVOL_RETENTION_DAYS ?? 365);
+const FLOW_AGGREGATE_RETENTION_HOURS = Number(process.env.FLOW_AGGREGATE_RETENTION_HOURS ?? 48);
 
 async function snapshotIndexTick(): Promise<void> {
   try {
@@ -960,6 +997,7 @@ async function snapshotSignal(): Promise<void> {
 async function pruneOldHistory(): Promise<void> {
   const cutoff = new Date(Date.now() - RETENTION_DAYS * 86_400_000);
   const dvolCutoff = new Date(Date.now() - DVOL_RETENTION_DAYS * 86_400_000);
+  const aggregateCutoff = new Date(Date.now() - FLOW_AGGREGATE_RETENTION_HOURS * 60 * 60_000);
   try {
     const [metrics, surface, trades, alerts, ticks, aggs, legacyDvol, durableDvol] = await Promise.all([
       prisma.metricSnapshot.deleteMany({ where: { ts: { lt: cutoff } } }),
@@ -967,12 +1005,12 @@ async function pruneOldHistory(): Promise<void> {
       prisma.flowTrade.deleteMany({ where: { ts: { lt: cutoff } } }),
       prisma.alertLog.deleteMany({ where: { firstSeen: { lt: cutoff } } }),
       prisma.indexTick.deleteMany({ where: { ts: { lt: cutoff } } }),
-      prisma.flowAggregateSnapshot.deleteMany({ where: { ts: { lt: cutoff } } }),
+      prisma.flowAggregateSnapshot.deleteMany({ where: { ts: { lt: aggregateCutoff } } }),
       prisma.dvolTick.deleteMany({ where: { ts: { lt: dvolCutoff } } }),
       durablePrisma.dvolTick.deleteMany({ where: { ts: { lt: dvolCutoff } } }),
     ]);
     console.log(
-      `[persist] pruned ${RETENTION_DAYS}d cutoff: metrics=${metrics.count} surface=${surface.count} trades=${trades.count} alerts=${alerts.count} ticks=${ticks.count} aggs=${aggs.count} · legacy dvol ${DVOL_RETENTION_DAYS}d=${legacyDvol.count} durable dvol=${durableDvol.count}`,
+      `[persist] pruned ${RETENTION_DAYS}d cutoff: metrics=${metrics.count} surface=${surface.count} trades=${trades.count} alerts=${alerts.count} ticks=${ticks.count} · aggregate ${FLOW_AGGREGATE_RETENTION_HOURS}h=${aggs.count} · legacy dvol ${DVOL_RETENTION_DAYS}d=${legacyDvol.count} durable dvol=${durableDvol.count}`,
     );
   } catch (err) {
     console.error('[persist] prune failed', err);
