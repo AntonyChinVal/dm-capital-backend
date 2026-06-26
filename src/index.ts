@@ -50,6 +50,7 @@ const HOST = process.env.HOST ?? '0.0.0.0';
 const FLOW_STREAM_MIN_BTC = Number(process.env.FLOW_STREAM_MIN_BTC ?? 1);
 const FLOW_AGG_MIN_BTC = Number(process.env.FLOW_AGG_MIN_BTC ?? 0.1);
 const DATA_DIR = process.env.DATA_DIR ?? '/data';
+const OPS_ALERT_LOG_INTERVAL_MS = 5 * 60_000;
 
 const app = express();
 app.use(cors());
@@ -147,6 +148,14 @@ interface DiskUsage {
   error?: string;
 }
 
+type OpsSeverity = 'ok' | 'warning' | 'critical';
+
+interface OpsAlert {
+  code: string;
+  severity: Exclude<OpsSeverity, 'ok'>;
+  message: string;
+}
+
 async function getDiskUsage(path: string): Promise<DiskUsage> {
   try {
     const stats = await statfs(path);
@@ -169,10 +178,76 @@ async function getDiskUsage(path: string): Promise<DiskUsage> {
   }
 }
 
+function buildOpsAlerts(dataDisk: DiskUsage, durable: ReturnType<typeof getDurableStatus>): OpsAlert[] {
+  const alerts: OpsAlert[] = [];
+  if (dataDisk.status === 'warning' || dataDisk.status === 'critical') {
+    alerts.push({
+      code: 'data_disk_usage',
+      severity: dataDisk.status,
+      message: `/data is ${dataDisk.usedPercent}% full`,
+    });
+  } else if (dataDisk.status === 'unknown') {
+    alerts.push({
+      code: 'data_disk_unknown',
+      severity: 'warning',
+      message: `cannot read /data disk usage${dataDisk.error ? `: ${dataDisk.error}` : ''}`,
+    });
+  }
+
+  if (durable.localDb === 'degraded') {
+    alerts.push({
+      code: 'local_db_degraded',
+      severity: 'critical',
+      message: 'local SQLite/outbox is degraded',
+    });
+  }
+
+  if (durable.durableDb === 'degraded') {
+    alerts.push({
+      code: 'durable_db_degraded',
+      severity: 'critical',
+      message: durable.lastFlushError ? `durable Postgres degraded: ${durable.lastFlushError}` : 'durable Postgres degraded',
+    });
+  }
+
+  const outboxAge = durable.oldestPendingOutboxAgeMs;
+  const warningAgeMs = Math.max(durable.flushIntervalMs * 2, 15 * 60_000);
+  const criticalAgeMs = Math.max(durable.flushIntervalMs * 6, 60 * 60_000);
+  if (durable.pendingOutbox > 0 && outboxAge != null && outboxAge >= warningAgeMs) {
+    alerts.push({
+      code: 'pending_outbox_age',
+      severity: outboxAge >= criticalAgeMs ? 'critical' : 'warning',
+      message: `oldest durable outbox row is ${Math.round(outboxAge / 60_000)}m old (${durable.pendingOutbox} pending)`,
+    });
+  }
+
+  return alerts;
+}
+
+let lastOpsAlertLogAt = 0;
+let lastOpsAlertSignature = '';
+
+function logOpsAlerts(alerts: OpsAlert[]): void {
+  if (!alerts.length) return;
+  const signature = alerts.map((alert) => `${alert.severity}:${alert.code}`).join('|');
+  const now = Date.now();
+  if (signature === lastOpsAlertSignature && now - lastOpsAlertLogAt < OPS_ALERT_LOG_INTERVAL_MS) return;
+  lastOpsAlertSignature = signature;
+  lastOpsAlertLogAt = now;
+  console.warn('[ops-alert]', JSON.stringify({ ts: now, alerts }));
+}
+
 app.get('/api/health', async (_req: Request, res: Response) => {
   const dvol = getDvol('btc_usd');
   const durable = getDurableStatus();
   const dataDisk = await getDiskUsage(DATA_DIR);
+  const opsAlerts = buildOpsAlerts(dataDisk, durable);
+  const opsStatus: OpsSeverity = opsAlerts.some((alert) => alert.severity === 'critical')
+    ? 'critical'
+    : opsAlerts.length
+      ? 'warning'
+      : 'ok';
+  logOpsAlerts(opsAlerts);
   res.json({
     ok: true,
     ts: Date.now(),
@@ -188,12 +263,16 @@ app.get('/api/health', async (_req: Request, res: Response) => {
     durableDb: durable.durableDb,
     localDb: durable.localDb,
     pendingOutbox: durable.pendingOutbox,
+    oldestPendingOutboxAt: durable.oldestPendingOutboxAt,
+    oldestPendingOutboxAgeMs: durable.oldestPendingOutboxAgeMs,
     lastDvolWrite: durable.lastDvolWrite,
     lastSignalWrite: durable.lastSignalWrite,
     lastDurableFlushAt: durable.lastFlushAt,
     durableFlushIntervalMs: durable.flushIntervalMs,
     durableError: durable.lastFlushError,
     dataDisk,
+    opsStatus,
+    opsAlerts,
   });
 });
 

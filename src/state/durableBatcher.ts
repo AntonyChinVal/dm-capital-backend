@@ -19,6 +19,8 @@ export interface DurableStatus {
   durableDb: 'ok' | 'degraded' | 'unknown';
   localDb: 'ok' | 'degraded' | 'unknown';
   pendingOutbox: number;
+  oldestPendingOutboxAt: number | null;
+  oldestPendingOutboxAgeMs: number | null;
   lastDvolWrite: number | null;
   lastSignalWrite: number | null;
   lastFlushAt: number | null;
@@ -62,6 +64,8 @@ const status: DurableStatus = {
   durableDb: 'unknown',
   localDb: 'unknown',
   pendingOutbox: 0,
+  oldestPendingOutboxAt: null,
+  oldestPendingOutboxAgeMs: null,
   lastDvolWrite: null,
   lastSignalWrite: null,
   lastFlushAt: null,
@@ -99,6 +103,24 @@ async function enqueue<K extends DurableKind>(
     },
   });
   status.localDb = 'ok';
+  refreshOutboxStatus().catch((err: unknown) => {
+    status.localDb = 'degraded';
+    console.error('[persist] outbox status refresh failed', err);
+  });
+}
+
+async function refreshOutboxStatus(): Promise<void> {
+  const [pendingOutbox, oldest] = await Promise.all([
+    localPrisma.durableOutbox.count(),
+    localPrisma.durableOutbox.findFirst({
+      orderBy: { createdAt: 'asc' },
+      select: { createdAt: true },
+    }),
+  ]);
+  const oldestPendingOutboxAt = oldest?.createdAt.getTime() ?? null;
+  status.pendingOutbox = pendingOutbox;
+  status.oldestPendingOutboxAt = oldestPendingOutboxAt;
+  status.oldestPendingOutboxAgeMs = oldestPendingOutboxAt == null ? null : Date.now() - oldestPendingOutboxAt;
 }
 
 export function enqueueDvolTick(value: number, currency = 'BTC', ts = new Date()): void {
@@ -172,9 +194,9 @@ export async function flushDurableBatch(): Promise<void> {
     orderBy: { createdAt: 'asc' },
     take: MAX_FLUSH_ROWS,
   });
-  status.pendingOutbox = rows.length;
   if (!rows.length) {
     status.localDb = 'ok';
+    await refreshOutboxStatus();
     status.lastFlushAt = Date.now();
     return;
   }
@@ -210,7 +232,7 @@ export async function flushDurableBatch(): Promise<void> {
   await pruneOutbox();
   status.durableDb = flushed.length === rows.length ? 'ok' : status.durableDb;
   status.localDb = 'ok';
-  status.pendingOutbox = await localPrisma.durableOutbox.count();
+  await refreshOutboxStatus();
   status.lastFlushAt = Date.now();
   if (status.durableDb === 'ok') status.lastFlushError = null;
 }
@@ -232,7 +254,7 @@ export async function refreshDurableStatus(): Promise<DurableStatus> {
   }
 
   try {
-    status.pendingOutbox = await localPrisma.durableOutbox.count();
+    await refreshOutboxStatus();
     status.localDb = 'ok';
   } catch (err) {
     status.localDb = 'degraded';
