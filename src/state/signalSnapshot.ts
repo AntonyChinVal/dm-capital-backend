@@ -91,9 +91,10 @@ export function buildSignalSnapshot(
     gammaFlip: finiteOrNull(bundle.macro.gammaFlip),
     callWall: finiteOrNull(bundle.macro.callWall),
     cascadeWall: finiteOrNull(bundle.macro.putWall),
-    dexNet: null,
-    flowDeltaNet: null,
-    flowVegaNet: null,
+    dexNet: finiteOrNull(bundle.dexSummary.netDex),
+    vexNet: finiteOrNull(bundle.vexSummary.netVex),
+    flowDeltaNet: flow1m.deltaCount > 0 ? finiteOrNull(flow1m.deltaFlowUsd) : null,
+    flowVegaNet: flow1m.vegaCount > 0 ? finiteOrNull(flow1m.vegaFlowUsd) : null,
     flowPremiumNet: flow1m.bucketsUsed > 0 ? finiteOrNull(flow1m.signedNotional) : null,
     regimeLabel: null,
   };

@@ -37,12 +37,13 @@ export interface SynthesisInputs {
   putWall: number | null;
   headlineSkew: number | null;
   signedNotional: number | null;
+  deltaFlowUsd?: number | null;
 }
 
 export function buildPanorama(inputs: SynthesisInputs): PanoramaTile[] {
   const regimen = classifyRegimen(inputs.spot, inputs.gammaFlip);
   const sesgo = classifySesgo(inputs.headlineSkew);
-  const netflow = classifyNetFlow(inputs.signedNotional);
+  const netflow = classifyNetFlow(inputs.deltaFlowUsd ?? inputs.signedNotional);
   const rangetrend = classifyRangeTrend(inputs.spot, inputs.callWall, inputs.putWall);
 
   return [

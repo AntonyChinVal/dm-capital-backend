@@ -57,6 +57,7 @@ export interface SignalSnapshotPayload {
   callWall: number | null;
   cascadeWall: number | null;
   dexNet: number | null;
+  vexNet: number | null;
   flowDeltaNet: number | null;
   flowVegaNet: number | null;
   flowPremiumNet: number | null;

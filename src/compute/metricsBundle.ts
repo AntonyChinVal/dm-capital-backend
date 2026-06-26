@@ -1,25 +1,41 @@
 import type { BookSummary } from '../types.js';
-import { gammaB76 } from './black76.js';
+import { gammaB76, vannaB76 } from './black76.js';
 import { parseInstrument } from './parseInstrument.js';
 import { filterLiquidStrikes } from './liquidStrikes.js';
 import { filterCurveStrikes } from './curveFilter.js';
 import { ivCurve } from './iv.js';
-import { oiByStrike, maxPain } from './oi.js';
+import { oiByStrike, maxPain, volumeByStrike, volOiByStrike, type StrikeVolOi } from './oi.js';
 import {
+  dexByStrike,
+  dexSummary,
   gexByStrike,
   regimeReport,
   resistanceWall,
   structuralCallWall,
   putSideWall,
+  vexByStrike,
+  vexSummary,
+  type DEXPoint,
+  type DexInput,
+  type DexSummary,
   type GexInput,
   type GexSweepOption,
   type GEXPoint,
   type Regime,
+  type VEXPoint,
+  type VexInput,
+  type VexSummary,
 } from './gex.js';
 import { atmIv } from './atmIv.js';
 import { expectedMoveBands } from './expectedMove.js';
 import { skew25d } from './skew.js';
+import { rankKeyStrikes, type KeyStrikeRow, type KeyStrikesBundle } from './keyStrikes.js';
+import { mergeCpRatios, type CpRatios } from './marketRatios.js';
 import { getGreeks } from '../state/greeks.js';
+
+export type { KeyStrikeRow, KeyStrikesBundle } from './keyStrikes.js';
+export type { StrikeVolOi } from './oi.js';
+export type { CpRatios } from './marketRatios.js';
 
 export interface ParsedOptionRow {
   instrument: string;
@@ -73,9 +89,18 @@ export interface MetricsBundle {
   count: number;
   maxPain: number | null;
   oi: ReturnType<typeof oiByStrike>;
+  volume: ReturnType<typeof volumeByStrike>;
+  volOi: StrikeVolOi[];
+  keyStrikes: KeyStrikesBundle;
   ivCurve: ReturnType<typeof ivCurve>;
   gex: GEXPoint[];
+  dex: DEXPoint[];
+  dexSummary: DexSummary;
+  vex: VEXPoint[];
+  vexSummary: VexSummary;
   gexCovered: number;
+  dexCovered: number;
+  vexCovered: number;
   gammaFlip: number | null;
   callWall: number | null;
   putWall: number | null;
@@ -149,6 +174,44 @@ function toGexRows(rows: ParsedOptionRow[], now = Date.now()): GexInput[] {
   return out;
 }
 
+function toDexRows(rows: ParsedOptionRow[]): DexInput[] {
+  const out: DexInput[] = [];
+  for (const r of rows) {
+    const delta = getGreeks(r.instrument)?.delta;
+    if (delta == null || !Number.isFinite(delta) || delta === 0) continue;
+    out.push({
+      strike: r.strike,
+      type: r.type,
+      openInterest: r.openInterest,
+      delta,
+      spot: r.underlyingPrice,
+    });
+  }
+  return out;
+}
+
+function toVexRows(rows: ParsedOptionRow[], now = Date.now()): VexInput[] {
+  const out: VexInput[] = [];
+  for (const r of rows) {
+    if (r.openInterest <= 0 || r.markIv <= 0) continue;
+    const vanna = vannaB76(
+      r.underlyingPrice,
+      r.strike,
+      tenorYears(r.expirationTimestamp, now),
+      r.markIv,
+    );
+    if (!Number.isFinite(vanna) || vanna === 0) continue;
+    out.push({
+      strike: r.strike,
+      type: r.type,
+      openInterest: r.openInterest,
+      vanna,
+      spot: r.underlyingPrice,
+    });
+  }
+  return out;
+}
+
 function toSweepOptions(rows: ParsedOptionRow[], now = Date.now()): GexSweepOption[] {
   return rows
     .filter((r) => r.openInterest > 0 && r.markIv > 0)
@@ -184,7 +247,13 @@ function computeScopeLevels(
   now = Date.now(),
 ): {
   gex: GEXPoint[];
+  dex: DEXPoint[];
+  vex: VEXPoint[];
   gexCovered: number;
+  dexCovered: number;
+  vexCovered: number;
+  dexSummary: DexSummary;
+  vexSummary: VexSummary;
   gammaFlip: number | null;
   callWall: number | null;
   putWall: number | null;
@@ -200,6 +269,12 @@ function computeScopeLevels(
     liquidRows[0]?.underlyingPrice ??
     refSpot;
   const gex = gexByStrike(gexRows, refPrice);
+  const dexRows = toDexRows(liquidRows);
+  const dex = dexByStrike(dexRows, refPrice);
+  const dexStats = dexSummary(dex);
+  const vexRows = toVexRows(liquidRows, now);
+  const vex = vexByStrike(vexRows, refPrice);
+  const vexStats = vexSummary(vex);
   const sweep = toSweepOptions(liquidRows, now);
   const levels = regimeReport(gex, refSpot, sweep);
   const putSideOpts = opts
@@ -209,7 +284,13 @@ function computeScopeLevels(
   const support = putSideWall(gex, wallRefPrice, putSideOpts);
   return {
     gex,
+    dex,
+    vex,
     gexCovered: gexRows.length,
+    dexCovered: dexRows.length,
+    vexCovered: vexRows.length,
+    dexSummary: dexStats,
+    vexSummary: vexStats,
     gammaFlip: levels.gammaFlip,
     callWall: levels.callWall,
     putWall: structuralPut,
@@ -269,11 +350,22 @@ export function computeMetricsBundle(
 
   const mp = maxPain(oiByStrike(expRows));
 
-  const curveSource =
-    scope === 'market'
-      ? filterCurveStrikes(liquidBook, { now })
-      : filterCurveStrikes(liquidExp, { now });
+  // Smile/smirk is always per selected expiration — never full-book aggregate.
+  const curveSource = filterCurveStrikes(liquidExp, { now });
   const iv = ivCurve(curveSource);
+
+  const volume =
+    scope === 'market'
+      ? volumeByStrike(
+          liquidBook.map((r) => ({
+            strike: r.strike,
+            type: r.type,
+            volume: r.volume,
+          })),
+        )
+      : volumeByStrike(expRows);
+  const volOi = volOiByStrike(oi, volume);
+  const keyStrikes = rankKeyStrikes(scopeLevels.gex, oi, volume);
 
   const atmIvValue = atmIv(liquidExp, future);
   const daysToExpiry = (expRows[0].expirationTimestamp - now) / 86_400_000;
@@ -287,9 +379,18 @@ export function computeMetricsBundle(
     count: expRows.length,
     maxPain: maxPainStrike,
     oi,
+    volume,
+    volOi,
+    keyStrikes,
     ivCurve: iv,
     gex: scopeLevels.gex,
+    dex: scopeLevels.dex,
+    dexSummary: scopeLevels.dexSummary,
+    vex: scopeLevels.vex,
+    vexSummary: scopeLevels.vexSummary,
     gexCovered: scopeLevels.gexCovered,
+    dexCovered: scopeLevels.dexCovered,
+    vexCovered: scopeLevels.vexCovered,
     gammaFlip: scopeLevels.gammaFlip,
     callWall: scopeCallWall,
     putWall: scopePutWall,
@@ -381,4 +482,95 @@ export function buildSkewTermStructure(
       putIv: sk.putIv ?? null,
     };
   });
+}
+
+export interface AtmTermPoint {
+  expiration: string;
+  tenorDays: number;
+  atmIv: number | null;
+}
+
+/** ATM IV level vs DTE for all expirations in the book. */
+export function buildAtmTermStructure(allRows: ParsedOptionRow[], now = Date.now()): AtmTermPoint[] {
+  const liquid = filterLiquidStrikes(allRows);
+  const byExp = new Map<string, { ts: number; rows: ParsedOptionRow[] }>();
+  for (const r of liquid) {
+    let bucket = byExp.get(r.expiration);
+    if (!bucket) {
+      bucket = { ts: r.expirationTimestamp, rows: [] };
+      byExp.set(r.expiration, bucket);
+    }
+    bucket.rows.push(r);
+  }
+  return [...byExp.entries()]
+    .sort((a, b) => a[1].ts - b[1].ts)
+    .map(([expiration, bucket]) => {
+      const forward = bucket.rows[0]?.underlyingPrice ?? 0;
+      return {
+        expiration,
+        tenorDays: Math.max(1, Math.round((bucket.ts - now) / 86_400_000)),
+        atmIv: forward > 0 ? atmIv(bucket.rows, forward) : null,
+      };
+    });
+}
+
+export interface ExpectedMoveRow {
+  expiration: string;
+  tenorDays: number;
+  atmIv: number | null;
+  sigma1: number | null;
+  sigma2: number | null;
+}
+
+/** Expected move bands for every future expiration. */
+export function buildExpectedMoveTable(
+  allRows: ParsedOptionRow[],
+  spot: number,
+  now = Date.now(),
+): ExpectedMoveRow[] {
+  const liquid = filterLiquidStrikes(allRows);
+  const byExp = new Map<string, { ts: number; rows: ParsedOptionRow[] }>();
+  for (const r of liquid) {
+    if (r.expirationTimestamp <= now) continue;
+    let bucket = byExp.get(r.expiration);
+    if (!bucket) {
+      bucket = { ts: r.expirationTimestamp, rows: [] };
+      byExp.set(r.expiration, bucket);
+    }
+    bucket.rows.push(r);
+  }
+  return [...byExp.entries()]
+    .sort((a, b) => a[1].ts - b[1].ts)
+    .map(([expiration, bucket]) => {
+      const forward = bucket.rows[0]?.underlyingPrice ?? spot;
+      const tenorDays = Math.max(0.01, (bucket.ts - now) / 86_400_000);
+      const iv = forward > 0 ? atmIv(bucket.rows, forward) : null;
+      const bands = iv != null ? expectedMoveBands(forward, iv, tenorDays) : null;
+      return {
+        expiration,
+        tenorDays,
+        atmIv: iv,
+        sigma1: bands?.sigma1 ?? null,
+        sigma2: bands?.sigma2 ?? null,
+      };
+    });
+}
+
+/** Full-book C/P ratios for header (OI + GEX). */
+export function computeMarketRatios(
+  allRows: ParsedOptionRow[],
+  spot: number,
+  now = Date.now(),
+): CpRatios {
+  const liquid = filterLiquidStrikes(allRows);
+  const oi = oiByStrike(
+    liquid.map((r) => ({
+      strike: r.strike,
+      type: r.type,
+      openInterest: r.openInterest,
+    })),
+  );
+  const refPrice = liquid[0]?.underlyingPrice ?? spot;
+  const gex = gexByStrike(toGexRows(liquid, now), refPrice);
+  return mergeCpRatios(oi, gex);
 }

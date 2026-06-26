@@ -30,6 +30,10 @@ export interface FlowEvent {
   amount: number;
   notionalUsd: number;
   signedNotional: number;   // Phase 8: directional-sentiment sign × notionalUsd
+  delta: number | null;
+  deltaFlowUsd: number | null; // Phase B: raw aggressor sign × signed delta × amount × spot
+  vega: number | null;
+  vegaFlowUsd: number | null;  // Phase D: aggressor sign × vega × amount (USD per 1 IV point)
   premium: number;
   iv: number | null;
   priorIv: number | null;
@@ -73,6 +77,18 @@ export function classifyTrade(raw: DeribitTrade): FlowEvent | null {
   const signedNotional = sign * notionalUsd;
 
   const prior = getGreeks(raw.instrument_name);
+  const delta = prior?.delta;
+  const vega = prior?.vega;
+  const aggressorSign = raw.direction === 'buy' ? 1 : -1;
+  const deltaFlowUsd =
+    delta != null && Number.isFinite(delta) && index > 0
+      ? aggressorSign * delta * raw.amount * index
+      : null;
+  // Deribit ticker vega is already USD per 1 IV point per contract — no × spot.
+  const vegaFlowUsd =
+    vega != null && Number.isFinite(vega)
+      ? aggressorSign * vega * raw.amount
+      : null;
   const priorIv = prior?.markIv ?? null;
   const iv = raw.iv ?? null;
   const ivDelta = iv != null && priorIv != null ? iv - priorIv : null;
@@ -89,6 +105,10 @@ export function classifyTrade(raw: DeribitTrade): FlowEvent | null {
     amount: raw.amount,
     notionalUsd,
     signedNotional,
+    delta: delta != null && Number.isFinite(delta) ? delta : null,
+    deltaFlowUsd,
+    vega: vega != null && Number.isFinite(vega) ? vega : null,
+    vegaFlowUsd,
     premium: raw.price,
     iv,
     priorIv,

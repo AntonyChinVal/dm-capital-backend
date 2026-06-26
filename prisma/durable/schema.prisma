@@ -129,9 +129,11 @@ model SignalSnapshot {
 
   /// Unit: USD delta notional. NULL until DEX exists; 0 means measured neutral.
   dexNet         Float?
+  /// Unit: USD delta-notional change per 1 point of IV. NULL until VEX exists.
+  vexNet         Float?
   /// Unit: USD notional, delta-weighted flow. NULL until measured.
   flowDeltaNet   Float?
-  /// Unit: USD notional, vega-weighted flow. NULL until measured.
+  /// Unit: USD vega per 1 IV point, aggressor-signed flow. NULL until measured.
   flowVegaNet    Float?
   /// Unit: USD premium/notional flow. NULL until measured.
   flowPremiumNet Float?

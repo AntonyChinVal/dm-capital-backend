@@ -2,6 +2,20 @@ import type { FlowEvent } from '../compute/tradeFlow.js';
 
 interface Bucket {
   signedNotional: number;
+  deltaFlowUsd: number;
+  deltaCount: number;
+  vegaFlowUsd: number;
+  vegaCount: number;
+  buyCount: number;
+  sellCount: number;
+}
+
+interface StoredBucket {
+  signedNotional: number;
+  deltaFlowUsd?: number;
+  deltaCount?: number;
+  vegaFlowUsd?: number;
+  vegaCount?: number;
   buyCount: number;
   sellCount: number;
 }
@@ -29,10 +43,26 @@ class FlowAggregator {
     const minute = Math.floor(event.ts / BUCKET_MS) * BUCKET_MS;
     const bucket = this.buckets.get(minute) ?? {
       signedNotional: 0,
+      deltaFlowUsd: 0,
+      deltaCount: 0,
+      vegaFlowUsd: 0,
+      vegaCount: 0,
       buyCount: 0,
       sellCount: 0,
     };
+    bucket.deltaFlowUsd ??= 0;
+    bucket.deltaCount ??= 0;
+    bucket.vegaFlowUsd ??= 0;
+    bucket.vegaCount ??= 0;
     bucket.signedNotional += event.signedNotional;
+    if (event.deltaFlowUsd != null && Number.isFinite(event.deltaFlowUsd)) {
+      bucket.deltaFlowUsd += event.deltaFlowUsd;
+      bucket.deltaCount += 1;
+    }
+    if (event.vegaFlowUsd != null && Number.isFinite(event.vegaFlowUsd)) {
+      bucket.vegaFlowUsd += event.vegaFlowUsd;
+      bucket.vegaCount += 1;
+    }
     if (event.side === 'buy') bucket.buyCount += 1;
     else bucket.sellCount += 1;
     this.buckets.set(minute, bucket);
@@ -40,6 +70,10 @@ class FlowAggregator {
 
   netForWindow(windowMinutes: number, nowMs = Date.now()): {
     signedNotional: number;
+    deltaFlowUsd: number;
+    deltaCount: number;
+    vegaFlowUsd: number;
+    vegaCount: number;
     buyCount: number;
     sellCount: number;
     bucketsUsed: number;
@@ -47,12 +81,20 @@ class FlowAggregator {
   } {
     const cutoff = nowMs - windowMinutes * 60_000;
     let signedNotional = 0;
+    let deltaFlowUsd = 0;
+    let deltaCount = 0;
+    let vegaFlowUsd = 0;
+    let vegaCount = 0;
     let buyCount = 0;
     let sellCount = 0;
     let bucketsUsed = 0;
     for (const [minute, bucket] of this.buckets) {
       if (minute >= cutoff && minute <= nowMs) {
         signedNotional += bucket.signedNotional;
+        deltaFlowUsd += bucket.deltaFlowUsd ?? 0;
+        deltaCount += bucket.deltaCount ?? 0;
+        vegaFlowUsd += bucket.vegaFlowUsd ?? 0;
+        vegaCount += bucket.vegaCount ?? 0;
         buyCount += bucket.buyCount;
         sellCount += bucket.sellCount;
         bucketsUsed += 1;
@@ -60,11 +102,41 @@ class FlowAggregator {
     }
     return {
       signedNotional,
+      deltaFlowUsd,
+      deltaCount,
+      vegaFlowUsd,
+      vegaCount,
       buyCount,
       sellCount,
       bucketsUsed,
       windowMinutes,
     };
+  }
+
+  seriesForWindow(windowMinutes: number, nowMs = Date.now()): Array<{
+    ts: number;
+    signedNotional: number;
+    deltaFlowUsd: number;
+    deltaCount: number;
+    vegaFlowUsd: number;
+    vegaCount: number;
+    buyCount: number;
+    sellCount: number;
+  }> {
+    const cutoff = nowMs - windowMinutes * 60_000;
+    return [...this.buckets.entries()]
+      .filter(([minute]) => minute >= cutoff && minute <= nowMs)
+      .sort((a, b) => a[0] - b[0])
+      .map(([minute, bucket]) => ({
+        ts: minute,
+        signedNotional: bucket.signedNotional,
+        deltaFlowUsd: bucket.deltaFlowUsd ?? 0,
+        deltaCount: bucket.deltaCount ?? 0,
+        vegaFlowUsd: bucket.vegaFlowUsd ?? 0,
+        vegaCount: bucket.vegaCount ?? 0,
+        buyCount: bucket.buyCount,
+        sellCount: bucket.sellCount,
+      }));
   }
 
   prune(nowMs = Date.now()): void {
@@ -89,12 +161,20 @@ class FlowAggregator {
    * Phase 11: restore buckets from snapshot (called once on startup).
    * Drops anything older than retention window.
    */
-  restoreBuckets(snapshot: Record<string, Bucket>, nowMs = Date.now()): void {
+  restoreBuckets(snapshot: Record<string, StoredBucket>, nowMs = Date.now()): void {
     const cutoff = nowMs - RETENTION_MS;
     for (const [minuteStr, bucket] of Object.entries(snapshot)) {
       const minute = Number(minuteStr);
       if (!Number.isFinite(minute) || minute < cutoff) continue;
-      this.buckets.set(minute, bucket);
+      this.buckets.set(minute, {
+        signedNotional: bucket.signedNotional,
+        deltaFlowUsd: bucket.deltaFlowUsd ?? 0,
+        deltaCount: bucket.deltaCount ?? 0,
+        vegaFlowUsd: bucket.vegaFlowUsd ?? 0,
+        vegaCount: bucket.vegaCount ?? 0,
+        buyCount: bucket.buyCount,
+        sellCount: bucket.sellCount,
+      });
     }
   }
 }

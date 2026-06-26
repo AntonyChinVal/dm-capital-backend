@@ -26,6 +26,19 @@ export function gammaB76(F: number, K: number, T: number, ivPct: number, r = 0):
   return (Math.exp(-r * T) * normPdf(d1)) / (F * sigma * Math.sqrt(T));
 }
 
+/**
+ * Vanna (Black-76): ∂Delta / ∂σ.
+ * Contract for VEX: vanna × OI × spot = delta-notional change per 1 IV point.
+ */
+export function vannaB76(F: number, K: number, T: number, ivPct: number): number {
+  if (ivPct <= 0 || T <= 0 || F <= 0 || K <= 0) return 0;
+  const sigma = ivPct / 100;
+  const sqrtT = Math.sqrt(T);
+  const d1 = (Math.log(F / K) + 0.5 * sigma * sigma * T) / (sigma * sqrtT);
+  const d2 = d1 - sigma * sqrtT;
+  return -(normPdf(d1) * d2) / sigma;
+}
+
 export function deltaB76(
   F: number,
   K: number,

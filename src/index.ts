@@ -10,6 +10,9 @@ import {
   computeMetricsBundle,
   parseBookRows,
   buildSkewTermStructure,
+  buildAtmTermStructure,
+  buildExpectedMoveTable,
+  computeMarketRatios,
 } from './compute/metricsBundle.js';
 import { filterLiquidStrikes } from './compute/liquidStrikes.js';
 import { filterCurveStrikes } from './compute/curveFilter.js';
@@ -513,6 +516,7 @@ app.get('/api/synthesis', async (req: Request, res: Response) => {
       putWall: bundle.macro.putWall,
       headlineSkew,
       signedNotional: flowNet.signedNotional,
+      deltaFlowUsd: flowNet.deltaFlowUsd,
     });
 
     const bridgeText = buildBridgeText(bundle.macro.callWall, bundle.macro.putWall, nextOpex);
@@ -533,6 +537,10 @@ app.get('/api/synthesis', async (req: Request, res: Response) => {
       flowNet: {
         window,
         signedNotional: flowNet.signedNotional,
+        deltaFlowUsd: flowNet.deltaFlowUsd,
+        deltaCount: flowNet.deltaCount,
+        vegaFlowUsd: flowNet.vegaFlowUsd,
+        vegaCount: flowNet.vegaCount,
         bucketsUsed: flowNet.bucketsUsed,
       },
     });
@@ -551,6 +559,7 @@ app.get('/api/flow/net', (req: Request, res: Response) => {
   res.json({
     window: windowParam,
     fetchedAt: Date.now(),
+    points: flowAggregator.seriesForWindow(windowMinutes),
     ...result,
   });
 });
@@ -568,6 +577,7 @@ const DVOL_HISTORY_WINDOWS: Record<string, number> = {
   '4h': 4 * 60 * 60_000,
   '24h': 24 * 60 * 60_000,
   '7d': 7 * 24 * 60 * 60_000,
+  '365d': 365 * 24 * 60 * 60_000,
 };
 
 app.get('/api/dvol/history', async (req: Request, res: Response) => {
@@ -588,6 +598,59 @@ app.get('/api/dvol/history', async (req: Request, res: Response) => {
       window: windowParam in DVOL_HISTORY_WINDOWS ? windowParam : '24h',
       fetchedAt: Date.now(),
       points: rows.map((r) => ({ ts: r.ts.getTime(), value: r.value })),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
+app.get('/api/dvol/rank', async (req: Request, res: Response) => {
+  try {
+    const currency = typeof req.query.currency === 'string' ? req.query.currency : 'BTC';
+    const live = getDvol('btc_usd');
+    const current = live?.value ?? null;
+    const since = new Date(Date.now() - DVOL_HISTORY_WINDOWS['365d']);
+
+    const rows = await durablePrisma.dvolTick.findMany({
+      where: { currency, ts: { gte: since } },
+      orderBy: { ts: 'asc' },
+      select: { ts: true, value: true },
+    });
+
+    if (current == null || !rows.length) {
+      return res.json({
+        currency,
+        current,
+        percentile: null,
+        samplePoints: rows.length,
+        sampleDays: rows.length >= 2
+          ? (rows[rows.length - 1].ts.getTime() - rows[0].ts.getTime()) / 86_400_000
+          : 0,
+        ready: false,
+        fetchedAt: Date.now(),
+      });
+    }
+
+    const values = rows.map((r) => r.value);
+    const belowOrEqual = values.filter((v) => v <= current).length;
+    const percentile = (belowOrEqual / values.length) * 100;
+    const sorted = [...values].sort((a, b) => a - b);
+    const pick = (p: number) => sorted[Math.min(sorted.length - 1, Math.floor(p * (sorted.length - 1)))];
+
+    res.json({
+      currency,
+      current,
+      percentile,
+      samplePoints: values.length,
+      sampleDays:
+        (rows[rows.length - 1].ts.getTime() - rows[0].ts.getTime()) / 86_400_000,
+      min: sorted[0],
+      max: sorted[sorted.length - 1],
+      p10: pick(0.1),
+      p50: pick(0.5),
+      p90: pick(0.9),
+      ready: values.length >= 60,
+      fetchedAt: Date.now(),
     });
   } catch (err) {
     res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
@@ -633,7 +696,7 @@ app.get('/api/expected-move/daily', async (req: Request, res: Response) => {
       return res.status(503).json({ error: 'atm iv not available' });
     }
 
-    const bands = expectedMoveBands(indexPrice.index_price, atm, 1);
+    const bands = expectedMoveBands(forward, atm, 1);
     res.json({
       ...bands,
       expiration: frontExp,
@@ -645,10 +708,35 @@ app.get('/api/expected-move/daily', async (req: Request, res: Response) => {
   }
 });
 
+app.get('/api/expected-move/table', async (req: Request, res: Response) => {
+  try {
+    const currency = typeof req.query.currency === 'string' ? req.query.currency : 'BTC';
+    const indexName = currency === 'BTC' ? 'btc_usd' : 'eth_usd';
+    const [indexPrice, summary] = await Promise.all([
+      fetchIndexPrice(indexName),
+      fetchBookSummary(currency),
+    ]);
+    const allRows = parseBookRows(summary);
+    const rows = buildExpectedMoveTable(allRows, indexPrice.index_price);
+    res.json({
+      currency,
+      spot: indexPrice.index_price,
+      rows,
+      fetchedAt: Date.now(),
+    });
+  } catch (err) {
+    res.status(502).json({ error: err instanceof Error ? err.message : String(err) });
+  }
+});
+
 app.get('/api/totals', async (req: Request, res: Response) => {
   try {
     const currency = typeof req.query.currency === 'string' ? req.query.currency : 'BTC';
-    const data = await fetchBookSummary(currency);
+    const indexName = currency === 'BTC' ? 'btc_usd' : 'eth_usd';
+    const [indexPrice, data] = await Promise.all([
+      fetchIndexPrice(indexName),
+      fetchBookSummary(currency),
+    ]);
     let notionalUsd = 0;
     let contracts = 0;
     for (const row of data) {
@@ -657,11 +745,14 @@ app.get('/api/totals', async (req: Request, res: Response) => {
       contracts += oi;
       notionalUsd += oi * px;
     }
+    const allRows = parseBookRows(data);
+    const ratios = computeMarketRatios(allRows, indexPrice.index_price);
     res.json({
       currency,
       contracts,
       notionalUsd,
       instrumentCount: data.length,
+      ...ratios,
       fetchedAt: Date.now(),
     });
   } catch (err) {
@@ -826,9 +917,18 @@ app.get('/api/metrics', async (req: Request, res: Response) => {
       count: bundle.count,
       maxPain: bundle.maxPain,
       oi: bundle.oi,
+      volume: bundle.volume,
+      volOi: bundle.volOi,
+      keyStrikes: bundle.keyStrikes,
       ivCurve: bundle.ivCurve,
       gex: bundle.gex,
+      dex: bundle.dex,
+      dexSummary: bundle.dexSummary,
+      vex: bundle.vex,
+      vexSummary: bundle.vexSummary,
       gexCovered: bundle.gexCovered,
+      dexCovered: bundle.dexCovered,
+      vexCovered: bundle.vexCovered,
       gammaFlip: bundle.gammaFlip,
       callWall: bundle.callWall,
       putWall: bundle.putWall,
@@ -868,6 +968,7 @@ app.get('/api/surface', async (req: Request, res: Response) => {
       maxTenors: 'all',
       excludeZeroDte: true,
     });
+    const atmTermStructure = buildAtmTermStructure(allRows);
 
     // Phase 5: structural-fear rule
     alertStream.push(checkStructuralFear(termStructure));
@@ -877,6 +978,7 @@ app.get('/api/surface', async (req: Request, res: Response) => {
       fetchedAt: Date.now(),
       axis,
       termStructure,
+      atmTermStructure,
       headlineSkew: pickHeadlineSkew(termStructure),
       headlineSkew30d: pickHeadlineSkew30d(
         buildSkewTermStructure(allRows, { maxTenors: 'all' }),

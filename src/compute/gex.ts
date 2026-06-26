@@ -16,6 +16,63 @@ export interface GexInput {
   spot?: number;
 }
 
+export interface DexInput {
+  strike: number;
+  type: 'C' | 'P';
+  openInterest: number;
+  delta: number;
+  /** Per-contract spot/forward multiplier; falls back to `defaultSpot`. */
+  spot?: number;
+}
+
+export interface DEXPoint {
+  strike: number;
+  callDex: number;
+  putDex: number;
+  netDex: number;
+}
+
+export interface DexSummary {
+  netDex: number;
+  callLoadedStrike: number | null;
+  putLoadedStrike: number | null;
+}
+
+export interface VexInput {
+  strike: number;
+  type: 'C' | 'P';
+  openInterest: number;
+  vanna: number;
+  /** Per-contract spot/forward multiplier; falls back to `defaultSpot`. */
+  spot?: number;
+}
+
+export interface VEXPoint {
+  strike: number;
+  callVex: number;
+  putVex: number;
+  netVex: number;
+}
+
+export interface VexSummary {
+  netVex: number;
+  positiveStrike: number | null;
+  negativeStrike: number | null;
+}
+
+export interface ExposureInput {
+  strike: number;
+  type: 'C' | 'P';
+  openInterest: number;
+}
+
+export interface StrikeExposurePoint {
+  strike: number;
+  callExposure: number;
+  putExposure: number;
+  netExposure: number;
+}
+
 export interface GexSweepOption {
   strike: number;
   type: 'C' | 'P';
@@ -36,29 +93,107 @@ export interface RegimeReport {
 }
 
 /**
+ * Generic signed exposure by strike. GEX, DEX and later VEX share the same
+ * grouping loop; each caller only changes the per-option weight.
+ */
+export function exposureByStrike<T extends ExposureInput>(
+  rows: T[],
+  weightFn: (row: T) => number,
+): StrikeExposurePoint[] {
+  const m = new Map<number, StrikeExposurePoint>();
+  for (const r of rows) {
+    if (r.openInterest <= 0) continue;
+    const weight = weightFn(r);
+    if (!Number.isFinite(weight) || weight === 0) continue;
+    let pt = m.get(r.strike);
+    if (!pt) {
+      pt = { strike: r.strike, callExposure: 0, putExposure: 0, netExposure: 0 };
+      m.set(r.strike, pt);
+    }
+    if (r.type === 'C') pt.callExposure += weight;
+    else pt.putExposure += weight;
+    pt.netExposure += weight;
+  }
+  return [...m.values()].sort((a, b) => a.strike - b.strike);
+}
+
+/**
  * GEX per strike (calls positive, puts negative).
  * Magnitude: gamma × OI × spot (per row or default).
  */
 export function gexByStrike(rows: GexInput[], defaultSpot: number): GEXPoint[] {
-  const m = new Map<number, GEXPoint>();
-  for (const r of rows) {
-    if (!Number.isFinite(r.gamma) || r.gamma === 0) continue;
-    let pt = m.get(r.strike);
-    if (!pt) {
-      pt = { strike: r.strike, callGex: 0, putGex: 0, netGex: 0 };
-      m.set(r.strike, pt);
-    }
+  return exposureByStrike(rows, (r) => {
     const spot = r.spot ?? defaultSpot;
     const magnitude = r.gamma * r.openInterest * spot;
-    if (r.type === 'C') {
-      pt.callGex += magnitude;
-      pt.netGex += magnitude;
-    } else {
-      pt.putGex += magnitude;
-      pt.netGex -= magnitude;
-    }
-  }
-  return [...m.values()].sort((a, b) => a.strike - b.strike);
+    return r.type === 'C' ? magnitude : -magnitude;
+  }).map((p) => ({
+    strike: p.strike,
+    callGex: p.callExposure,
+    putGex: Math.abs(p.putExposure),
+    netGex: p.netExposure,
+  }));
+}
+
+/**
+ * DEX per strike (delta is already signed by option type).
+ * Magnitude: delta × OI × spot, in USD delta notional.
+ */
+export function dexByStrike(rows: DexInput[], defaultSpot: number): DEXPoint[] {
+  return exposureByStrike(rows, (r) => {
+    const spot = r.spot ?? defaultSpot;
+    return r.delta * r.openInterest * spot;
+  }).map((p) => ({
+    strike: p.strike,
+    callDex: p.callExposure,
+    putDex: p.putExposure,
+    netDex: p.netExposure,
+  }));
+}
+
+export function dexSummary(points: DEXPoint[]): DexSummary {
+  const netDex = points.reduce((s, p) => s + p.netDex, 0);
+  const callLoaded = points
+    .filter((p) => p.callDex > 0)
+    .reduce<DEXPoint | null>((best, p) => (best == null || p.callDex > best.callDex ? p : best), null);
+  const putLoaded = points
+    .filter((p) => p.putDex < 0)
+    .reduce<DEXPoint | null>((best, p) => (best == null || p.putDex < best.putDex ? p : best), null);
+  return {
+    netDex,
+    callLoadedStrike: callLoaded?.strike ?? null,
+    putLoadedStrike: putLoaded?.strike ?? null,
+  };
+}
+
+/**
+ * VEX per strike (vanna is already mathematically signed).
+ * VEX = delta-notional change per 1 point of IV.
+ */
+export function vexByStrike(rows: VexInput[], defaultSpot: number): VEXPoint[] {
+  return exposureByStrike(rows, (r) => {
+    const spot = r.spot ?? defaultSpot;
+    return r.vanna * r.openInterest * spot;
+  }).map((p) => ({
+    strike: p.strike,
+    callVex: p.callExposure,
+    putVex: p.putExposure,
+    netVex: p.netExposure,
+  }));
+}
+
+export function vexSummary(points: VEXPoint[]): VexSummary {
+  const netVex = points.reduce((s, p) => s + p.netVex, 0);
+  const positive = points
+    .filter((p) => p.netVex > 0)
+    .reduce<VEXPoint | null>((best, p) => (best == null || p.netVex > best.netVex ? p : best), null);
+  const negative = points
+    .filter((p) => p.netVex < 0)
+    .reduce<VEXPoint | null>((best, p) => (best == null || p.netVex < best.netVex ? p : best), null);
+  return {
+    netVex,
+    positiveStrike: positive?.strike ?? null,
+    negativeStrike: negative?.strike ?? null,
+  };
 }
 
 function netGexAtPrice(options: GexSweepOption[], F: number, r = 0): number {
