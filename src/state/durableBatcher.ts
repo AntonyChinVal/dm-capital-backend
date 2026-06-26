@@ -320,14 +320,16 @@ async function writeSurface(payload: SurfaceSnapshotPayload): Promise<void> {
 }
 
 async function writeFlowTrade(payload: FlowTradePayload): Promise<void> {
-  await durablePrisma.flowTrade.create({
-    data: {
+  // id is the Deribit trade_id. On reconnect Deribit replays recent trades, so
+  // duplicates are expected — upsert lets Postgres no-op on conflict instead of
+  // raising a unique-constraint error that Prisma would log as noise.
+  await durablePrisma.flowTrade.upsert({
+    where: { id: payload.id },
+    create: {
       ...payload,
       ts: new Date(payload.ts),
     },
-  }).catch((err: unknown) => {
-    const msg = serialiseErr(err);
-    if (!msg.includes('Unique constraint')) throw err;
+    update: {},
   });
 }
 
