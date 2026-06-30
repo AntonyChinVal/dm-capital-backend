@@ -47,6 +47,7 @@ import {
   persistMetricSnapshot,
   persistSurfaceSnapshot,
 } from './state/writers.js';
+import { runSqliteMaintenanceIfNeeded } from './state/sqliteMaintenance.js';
 
 const PORT = Number(process.env.PORT ?? 4000);
 const HOST = process.env.HOST ?? '0.0.0.0';
@@ -1225,6 +1226,8 @@ async function pruneOldHistory(): Promise<void> {
     console.log(
       `[persist] pruned durable ${RETENTION_DAYS}d: metrics=${durableMetrics.count} surface=${durableSurface.count} alerts=${durableAlerts.count} ticks=${durableTicks.count} · durable flow ${FLOW_TRADE_RETENTION_DAYS}d=${durableTrades.count} · durable dvol ${DVOL_RETENTION_DAYS}d=${durableDvol.count} · sqlite legacy cleared: metrics=${legacyMetrics.count} surface=${legacySurface.count} trades=${legacyTrades.count} alerts=${legacyAlerts.count} ticks=${legacyTicks.count} dvol=${legacyDvol.count} · aggregate ${FLOW_AGGREGATE_RETENTION_HOURS}h=${aggs.count}`,
     );
+    const dataDisk = await getDiskUsage(DATA_DIR);
+    await runSqliteMaintenanceIfNeeded(dataDisk);
   } catch (err) {
     console.error('[persist] prune failed', err);
   }
