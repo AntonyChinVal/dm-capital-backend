@@ -21,15 +21,18 @@ interface StoredBucket {
 }
 
 const BUCKET_MS = 60_000;
+export const FLOW_BUCKET_MS = BUCKET_MS;
+export type FlowBucketMode = 'clock_aligned';
+
 const RETENTION_MS = 24 * 60 * 60_000;
 const PRUNE_INTERVAL_MS = 60_000;
 
 /**
  * Sliding-window aggregator for NetFlow (Phase 8).
- * 1-min buckets × 1440 (= 24h). Per-bucket sums of `signedNotional` from
- * the directional-sentiment convention (Hernán Q8). On restart, current
- * implementation loses 24h of buckets — backed by Prisma in Phase 11
- * (see B8.3).
+ * 1-min buckets × 1440 (= 24h), aligned to wall-clock minutes
+ * (`minute = floor(ts / 60s) * 60s`). Window sums buckets with
+ * `minute >= now - window` and `minute <= now` (inclusive borders;
+ * current minute bucket is partial). Hernán Q2-B (2026-06-29).
  */
 class FlowAggregator {
   private buckets = new Map<number, Bucket>();
@@ -180,3 +183,18 @@ class FlowAggregator {
 }
 
 export const flowAggregator = new FlowAggregator();
+
+/** Window metadata for API reconciliation (Hernán Q2-B). */
+export function flowWindowMeta(windowMinutes: number, nowMs = Date.now()): {
+  windowStart: number;
+  windowEnd: number;
+  bucketMs: number;
+  bucketMode: FlowBucketMode;
+} {
+  return {
+    windowStart: nowMs - windowMinutes * 60_000,
+    windowEnd: nowMs,
+    bucketMs: FLOW_BUCKET_MS,
+    bucketMode: 'clock_aligned',
+  };
+}

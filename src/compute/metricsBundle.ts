@@ -1,7 +1,7 @@
 import type { BookSummary } from '../types.js';
 import { gammaB76, vannaB76 } from './black76.js';
 import { parseInstrument } from './parseInstrument.js';
-import { filterLiquidStrikes } from './liquidStrikes.js';
+import { filterLiquidStrikes, LIQUID_STRIKE_FILTER } from './liquidStrikes.js';
 import { filterCurveStrikes } from './curveFilter.js';
 import { ivCurve } from './iv.js';
 import { oiByStrike, maxPain, volumeByStrike, volOiByStrike, type StrikeVolOi } from './oi.js';
@@ -12,6 +12,7 @@ import {
   regimeReport,
   resistanceWall,
   structuralCallWall,
+  structuralCallWallStable,
   putSideWall,
   putSideWallStable,
   vexByStrike,
@@ -240,6 +241,17 @@ function buildPutLiquidityMaps(rows: ParsedOptionRow[]): {
   return { putOiByStrike, putVolumeByStrike };
 }
 
+function buildCallLiquidityMaps(rows: ParsedOptionRow[]): {
+  callOiByStrike: Map<number, number>;
+} {
+  const callOiByStrike = new Map<number, number>();
+  for (const r of rows) {
+    if (r.type !== 'C') continue;
+    callOiByStrike.set(r.strike, (callOiByStrike.get(r.strike) ?? 0) + r.openInterest);
+  }
+  return { callOiByStrike };
+}
+
 function computeScopeLevels(
   liquidRows: ParsedOptionRow[],
   refSpot: number,
@@ -247,8 +259,11 @@ function computeScopeLevels(
   opts?: {
     putOiByStrike?: Map<number, number>;
     putVolumeByStrike?: Map<number, number>;
+    callOiByStrike?: Map<number, number>;
     /** When set, apply cascade hysteresis to the structural put wall (live read path only). */
     hysteresisKey?: string;
+    /** When set, apply call-wall hysteresis to structural call (live read path only). */
+    callHysteresisKey?: string;
   },
   now = Date.now(),
 ): {
@@ -290,6 +305,12 @@ function computeScopeLevels(
     ? putSideWallStable(gex, refSpot, opts.hysteresisKey, putSideOpts)
     : putSideWall(gex, refSpot, putSideOpts);
   const support = putSideWall(gex, wallRefPrice, putSideOpts);
+  const callWallOpts = opts?.callOiByStrike
+    ? { callOiByStrike: opts.callOiByStrike }
+    : undefined;
+  const structuralCall = opts?.callHysteresisKey
+    ? structuralCallWallStable(gex, opts.callHysteresisKey, callWallOpts)
+    : structuralCallWall(gex, callWallOpts);
   return {
     gex,
     dex,
@@ -304,7 +325,7 @@ function computeScopeLevels(
     putWall: structuralPut,
     resistance: resistanceWall(gex, wallRefPrice),
     support,
-    structuralCall: structuralCallWall(gex),
+    structuralCall,
     structuralPut,
     regime: levels.regime,
     netGex: levels.netGex,
@@ -335,6 +356,7 @@ export function computeMetricsBundle(
 
   const scopeRows = scope === 'market' ? liquidBook : liquidExp;
   const macroLiquidity = buildPutLiquidityMaps(liquidBook);
+  const macroCallLiquidity = buildCallLiquidityMaps(liquidBook);
   const localLiquidity = buildPutLiquidityMaps(liquidExp);
 
   const scopeLevels = computeScopeLevels(
@@ -351,8 +373,13 @@ export function computeMetricsBundle(
     spotPrice,
     spotPrice,
     opts?.cascadeHysteresisKey
-      ? { ...macroLiquidity, hysteresisKey: `${opts.cascadeHysteresisKey}:macro-cascade` }
-      : macroLiquidity,
+      ? {
+          ...macroLiquidity,
+          ...macroCallLiquidity,
+          hysteresisKey: `${opts.cascadeHysteresisKey}:macro-cascade`,
+          callHysteresisKey: `${opts.cascadeHysteresisKey}:macro-call`,
+        }
+      : { ...macroLiquidity, ...macroCallLiquidity },
     now,
   );
   const localLevels = computeScopeLevels(liquidExp, spotPrice, future, localLiquidity, now);
@@ -585,7 +612,11 @@ export function computeMarketRatios(
   allRows: ParsedOptionRow[],
   spot: number,
   now = Date.now(),
-): CpRatios {
+): CpRatios & {
+  oiCpScope: 'full_book_liquid';
+  gexCpScope: 'full_book_liquid';
+  liquidFilter: typeof LIQUID_STRIKE_FILTER;
+} {
   const liquid = filterLiquidStrikes(allRows);
   const oi = oiByStrike(
     liquid.map((r) => ({
@@ -596,5 +627,10 @@ export function computeMarketRatios(
   );
   const refPrice = liquid[0]?.underlyingPrice ?? spot;
   const gex = gexByStrike(toGexRows(liquid, now), refPrice);
-  return mergeCpRatios(oi, gex);
+  return {
+    ...mergeCpRatios(oi, gex),
+    oiCpScope: 'full_book_liquid',
+    gexCpScope: 'full_book_liquid',
+    liquidFilter: LIQUID_STRIKE_FILTER,
+  };
 }

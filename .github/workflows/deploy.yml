@@ -1,8 +1,12 @@
 name: Deploy (Fly.io)
 
+# Auto-deploy on push is DISABLED for now — deploys are done manually with
+# `flyctl deploy` (see .cursor/skills/dm-capital-deploy). Re-enable by
+# uncommenting the `push` trigger below. The workflow still runs on demand
+# from the Actions tab via workflow_dispatch.
 on:
-  push:
-    branches: [master]
+  # push:
+  #   branches: [master]
   workflow_dispatch:
 
 concurrency:

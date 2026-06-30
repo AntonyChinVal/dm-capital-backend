@@ -165,14 +165,17 @@ export function dexSummary(points: DEXPoint[]): DexSummary {
   };
 }
 
+/** IV moves in vol points; 1 IV point = 0.01 absolute vol (Hernán 2026-06-29). */
+const VEX_PER_IV_POINT = 0.01;
+
 /**
  * VEX per strike (vanna is already mathematically signed).
- * VEX = delta-notional change per 1 point of IV.
+ * VEX = delta-notional change per 1 IV point (0.01 vol).
  */
 export function vexByStrike(rows: VexInput[], defaultSpot: number): VEXPoint[] {
   return exposureByStrike(rows, (r) => {
     const spot = r.spot ?? defaultSpot;
-    return r.vanna * r.openInterest * spot;
+    return r.vanna * r.openInterest * spot * VEX_PER_IV_POINT;
   }).map((p) => ({
     strike: p.strike,
     callVex: p.callExposure,
@@ -388,13 +391,76 @@ export function supportWall(
   return putSideWall(points, refPrice, { putOiByStrike, putVolumeByStrike });
 }
 
-/** Structural call wall — max positive net GEX on the full book. */
-export function structuralCallWall(points: GEXPoint[]): number | null {
+export interface CallSideWallOpts {
+  callOiByStrike?: Map<number, number>;
+  /**
+   * Near-tie band (fraction of stronger net GEX) before tie-breaking on call OI.
+   * Hernán 2026-06-29: ~1.5% for call wall stability.
+   */
+  nearTiePct?: number;
+}
+
+const DEFAULT_CALL_WALL_NEAR_TIE_PCT = 0.015;
+
+function pickStructuralCallCandidate(
+  points: GEXPoint[],
+  opts?: CallSideWallOpts,
+): GEXPoint | null {
   if (!points.length) return null;
   const positive = points.filter((p) => p.netGex > 0);
-  if (!positive.length) return callWall(points);
-  const w = positive.reduce((a, b) => (b.netGex > a.netGex ? b : a));
-  return w.strike;
+  if (!positive.length) {
+    const strike = callWall(points);
+    return strike != null ? (points.find((p) => p.strike === strike) ?? null) : null;
+  }
+  const nearTie = opts?.nearTiePct ?? DEFAULT_CALL_WALL_NEAR_TIE_PCT;
+  const { callOiByStrike } = opts ?? {};
+  return positive.reduce((a, b) => {
+    if (b.netGex > a.netGex * (1 + nearTie)) return b;
+    if (a.netGex > b.netGex * (1 + nearTie)) return a;
+    const oiA = callOiByStrike?.get(a.strike) ?? 0;
+    const oiB = callOiByStrike?.get(b.strike) ?? 0;
+    if (oiB !== oiA) return oiB > oiA ? b : a;
+    return b.netGex > a.netGex ? b : a;
+  });
+}
+
+/** Structural call wall — max positive net GEX on the full book; tie-break call OI on near-ties. */
+export function structuralCallWall(points: GEXPoint[], opts?: CallSideWallOpts): number | null {
+  return pickStructuralCallCandidate(points, opts)?.strike ?? null;
+}
+
+const callWallHysteresis = new Map<string, HysteresisState>();
+
+/**
+ * Hysteresis for structural call wall (Hernán 2026-06-29): mirror cascade stability.
+ * Stateful per `key`; live read path only — never from persistence.
+ */
+export function structuralCallWallStable(
+  points: GEXPoint[],
+  key: string,
+  opts?: CallSideWallOpts & { margin?: number },
+): number | null {
+  const candidatePt = pickStructuralCallCandidate(points, opts);
+  if (!candidatePt) return null;
+  const candidate = candidatePt.strike;
+
+  const margin = opts?.margin ?? 0.15;
+  const candidateMag = netGexAtStrike(points, candidate);
+  const prev = callWallHysteresis.get(key);
+
+  if (prev) {
+    const prevStillValid = points.some((p) => p.strike === prev.strike);
+    if (prevStillValid && candidate !== prev.strike) {
+      const prevMag = netGexAtStrike(points, prev.strike);
+      if (candidateMag <= prevMag * (1 + margin)) {
+        callWallHysteresis.set(key, { strike: prev.strike, magnitude: prevMag });
+        return prev.strike;
+      }
+    }
+  }
+
+  callWallHysteresis.set(key, { strike: candidate, magnitude: candidateMag });
+  return candidate;
 }
 
 /** Structural put wall — min net GEX below index spot on the full book. */

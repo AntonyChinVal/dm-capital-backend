@@ -31,7 +31,7 @@ import {
   checkWallApproach,
 } from './compute/signals.js';
 import { classifyTrade, type DeribitTrade } from './compute/tradeFlow.js';
-import { flowAggregator } from './state/aggregator.js';
+import { flowAggregator, flowWindowMeta } from './state/aggregator.js';
 import { alertStream } from './state/alerts.js';
 import { getDurableStatus, startDurableBatcher } from './state/durableBatcher.js';
 import { getDvol, updateDvol } from './state/dvol.js';
@@ -555,11 +555,13 @@ app.get('/api/flow/net', (req: Request, res: Response) => {
   if (!VALID_WINDOWS.has(windowMinutes)) {
     return res.status(400).json({ error: 'window must be one of 1h, 4h, 24h' });
   }
-  const result = flowAggregator.netForWindow(windowMinutes);
+  const nowMs = Date.now();
+  const result = flowAggregator.netForWindow(windowMinutes, nowMs);
   res.json({
     window: windowParam,
-    fetchedAt: Date.now(),
-    points: flowAggregator.seriesForWindow(windowMinutes),
+    fetchedAt: nowMs,
+    points: flowAggregator.seriesForWindow(windowMinutes, nowMs),
+    ...flowWindowMeta(windowMinutes, nowMs),
     ...result,
   });
 });

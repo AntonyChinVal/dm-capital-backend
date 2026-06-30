@@ -13,6 +13,7 @@ import {
 import { pickHeadlineSkew, pickSkewTiles } from '../src/compute/interpret/skewTiles.js';
 import { filterLiquidStrikes } from '../src/compute/liquidStrikes.js';
 import { filterCurveStrikes } from '../src/compute/curveFilter.js';
+import { computeMarketRatios } from '../src/compute/metricsBundle.js';
 
 const SNAPSHOT_AT = Date.parse('2026-06-18T21:06:00Z');
 const SPOT = 63_026;
@@ -109,6 +110,10 @@ function main() {
   const tiles = pickSkewTilesFromRows(allRows);
   const tile90 = tiles.find((t) => t.targetDays === 90);
   const tile180 = tiles.find((t) => t.targetDays === 180);
+  const ratios = computeMarketRatios(allRows, SPOT, SNAPSHOT_AT);
+  const rawCallsOi = allRows.filter((r) => r.type === 'C').reduce((s, r) => s + r.openInterest, 0);
+  const rawPutsOi = allRows.filter((r) => r.type === 'P').reduce((s, r) => s + r.openInterest, 0);
+  const rawOiCp = rawPutsOi > 0 ? rawCallsOi / rawPutsOi : null;
 
   if (!market || !local19 || !local26) {
     console.error('computeMetricsBundle returned null');
@@ -146,6 +151,14 @@ function main() {
   results.push(checkMax('Max IV in curve (< cap)', maxIv26, 124, '%'));
   console.log(
     `INFO  Garbage wings 26JUN (IV≥125, vol=0): ${garbageBefore} before → ${garbageAfter} after curve filter`,
+  );
+
+  console.log('\nOI C/P scope (Q1-A — full-book liquid vs raw):');
+  console.log(
+    `INFO  Raw full book OI C/P: ${rawOiCp?.toFixed(4) ?? '—'}  (${rawCallsOi.toFixed(1)} / ${rawPutsOi.toFixed(1)} BTC)`,
+  );
+  console.log(
+    `INFO  Liquid full book OI C/P: ${ratios.oiCpRatio?.toFixed(4) ?? '—'}  scope=${ratios.oiCpScope}  filter=${JSON.stringify(ratios.liquidFilter)}`,
   );
 
   const failed = results.filter((r) => {

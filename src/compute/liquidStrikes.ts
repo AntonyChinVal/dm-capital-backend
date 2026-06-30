@@ -13,8 +13,16 @@ export interface LiquidFilterOptions {
   maxMoneyness?: number;
 }
 
-const DEFAULT_MIN_MONEYNESS = 0.4;
-const DEFAULT_MAX_MONEYNESS = 2.5;
+export const DEFAULT_MIN_MONEYNESS = 0.4;
+export const DEFAULT_MAX_MONEYNESS = 2.5;
+
+/** Documented filter applied globally to strike-based metrics (Hernán Q3). */
+export const LIQUID_STRIKE_FILTER = {
+  minMoneyness: DEFAULT_MIN_MONEYNESS,
+  maxMoneyness: DEFAULT_MAX_MONEYNESS,
+  requireMarkIvPositive: true,
+  requireOiOrVolume: true,
+} as const;
 
 /**
  * Keep strikes with activity and reasonable moneyness vs each row's forward.
