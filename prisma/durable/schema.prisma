@@ -118,8 +118,11 @@ model SignalSnapshot {
   /// Unit: vol percentage-point skew at constant 180D maturity.
   skew180d       Float?
 
-  /// Unit: USD gamma exposure per 1% move.
+  /// Unit: USD gamma exposure per $1 spot move (gamma × OI × spot).
+  /// Per 1% move = gexNet × spot × 0.01.
   gexNet         Float?
+  /// Contract unit for gexNet — always usd_per_1usd_move from schema v2 onward.
+  gexUnit        String   @default("usd_per_1usd_move")
   /// Unit: USD strike level where net gamma flips sign.
   gammaFlip      Float?
   /// Unit: USD strike level of strongest positive GEX / call wall.

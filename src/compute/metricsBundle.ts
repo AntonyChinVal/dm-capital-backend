@@ -21,6 +21,7 @@ import {
   type DexInput,
   type DexSummary,
   type GexInput,
+  type GexExpiryInput,
   type GexSweepOption,
   type GEXPoint,
   type Regime,
@@ -171,6 +172,25 @@ function toGexRows(rows: ParsedOptionRow[], now = Date.now()): GexInput[] {
       openInterest: r.openInterest,
       gamma,
       spot: r.underlyingPrice,
+    });
+  }
+  return out;
+}
+
+/** GEX rows with expiry metadata — for gammaShareByExpiry and release attribution. */
+export function toGexExpiryRows(rows: ParsedOptionRow[], now = Date.now()): GexExpiryInput[] {
+  const out: GexExpiryInput[] = [];
+  for (const r of rows) {
+    const gamma = rowGamma(r, now);
+    if (gamma == null || !Number.isFinite(gamma) || gamma === 0) continue;
+    out.push({
+      strike: r.strike,
+      type: r.type,
+      openInterest: r.openInterest,
+      gamma,
+      spot: r.underlyingPrice,
+      expiration: r.expiration,
+      expirationTimestamp: r.expirationTimestamp,
     });
   }
   return out;

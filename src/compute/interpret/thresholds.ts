@@ -37,6 +37,12 @@ export const THRESHOLDS = {
     centralHigh: 0.67,
   },
 
+  // Proximity in units of daily EM 1σ (Panorama copy — Hernán 2026-07-02)
+  proximity: {
+    at: 0.5,
+    near: 1.5,
+  },
+
   // SkewTiles target tenors (B9.3 algorithm)
   skewTiles: {
     targetsDays: [7, 30, 90, 180] as const,

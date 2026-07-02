@@ -9,6 +9,7 @@ import { parseInstrument } from './compute/parseInstrument.js';
 import {
   computeMetricsBundle,
   parseBookRows,
+  toGexExpiryRows,
   buildSkewTermStructure,
   buildAtmTermStructure,
   buildExpectedMoveTable,
@@ -20,7 +21,8 @@ import { buildSurface } from './compute/ivSurface.js';
 import { buildSurfaceByDelta } from './compute/ivSurfaceDelta.js';
 import { atmIv } from './compute/atmIv.js';
 import { classifyExpiration } from './compute/classifyExpiration.js';
-import { expectedMoveBands } from './compute/expectedMove.js';
+import { dominantGammaExpiryInRange } from './compute/gex.js';
+import { expectedMove24hBands, expectedMoveBands } from './compute/expectedMove.js';
 import { buildPanorama, buildBridgeText } from './compute/interpret/synthesis.js';
 import { pickSkewTiles, pickHeadlineSkew, pickHeadlineSkew30d } from './compute/interpret/skewTiles.js';
 import {
@@ -510,6 +512,47 @@ app.get('/api/synthesis', async (req: Request, res: Response) => {
       return null;
     })();
 
+    const nowMs = Date.now();
+    const localPut = bundle.local.support;
+    const localCall = bundle.local.resistance;
+    const liquidBook = filterLiquidStrikes(allRows);
+    const gexExpiryRows = toGexExpiryRows(liquidBook, nowMs);
+    const dominant =
+      localPut != null && localCall != null
+        ? dominantGammaExpiryInRange(
+            localPut,
+            localCall,
+            gexExpiryRows,
+            indexPrice.index_price,
+            nowMs,
+          )
+        : null;
+
+    const emDaily = (() => {
+      const futureRows = liquidBook
+        .filter((r) => r.expirationTimestamp > nowMs)
+        .sort((a, b) => a.expirationTimestamp - b.expirationTimestamp);
+      if (!futureRows.length) return null;
+      const front = futureRows[0];
+      const frontRows = futureRows.filter((r) => r.expiration === front.expiration);
+      const forward = front.underlyingPrice;
+      const frontAtm = atmIv(frontRows, forward);
+      if (frontAtm == null) return null;
+      const frontHoursLeft = (front.expirationTimestamp - nowMs) / 3_600_000;
+      const nextRow = futureRows.find((r) => r.expiration !== front.expiration);
+      const nextAtm = nextRow
+        ? atmIv(futureRows.filter((r) => r.expiration === nextRow.expiration), forward)
+        : null;
+      return expectedMove24hBands(
+        forward,
+        frontAtm,
+        frontHoursLeft,
+        front.expiration,
+        nextAtm,
+        nextRow?.expiration ?? null,
+      );
+    })();
+
     const panorama = buildPanorama({
       spot: indexPrice.index_price,
       gammaFlip: bundle.macro.gammaFlip,
@@ -518,9 +561,10 @@ app.get('/api/synthesis', async (req: Request, res: Response) => {
       headlineSkew,
       signedNotional: flowNet.signedNotional,
       deltaFlowUsd: flowNet.deltaFlowUsd,
+      em1sigmaDaily: emDaily?.sigma1 ?? null,
     });
 
-    const bridgeText = buildBridgeText(bundle.macro.callWall, bundle.macro.putWall, nextOpex);
+    const bridge = buildBridgeText(localCall, localPut, { dominant, nextOpex });
 
     res.json({
       currency,
@@ -531,7 +575,8 @@ app.get('/api/synthesis', async (req: Request, res: Response) => {
       future: bundle.future,
       macro: bundle.macro,
       panorama,
-      bridgeText,
+      bridgeText: bridge.text,
+      bridgeCritical: bridge.critical,
       skewTiles,
       headlineSkew,
       headlineSkew30d,
@@ -635,6 +680,27 @@ app.get('/api/dvol/rank', async (req: Request, res: Response) => {
     }
 
     const values = rows.map((r) => r.value);
+    const sampleDays =
+      (rows[rows.length - 1].ts.getTime() - rows[0].ts.getTime()) / 86_400_000;
+    const MIN_RANK_DAYS = 30;
+
+    if (sampleDays < MIN_RANK_DAYS) {
+      return res.json({
+        currency,
+        current,
+        percentile: null,
+        samplePoints: values.length,
+        sampleDays,
+        min: null,
+        max: null,
+        p10: null,
+        p50: null,
+        p90: null,
+        ready: false,
+        fetchedAt: Date.now(),
+      });
+    }
+
     const belowOrEqual = values.filter((v) => v <= current).length;
     const percentile = (belowOrEqual / values.length) * 100;
     const sorted = [...values].sort((a, b) => a - b);
@@ -645,8 +711,7 @@ app.get('/api/dvol/rank', async (req: Request, res: Response) => {
       current,
       percentile,
       samplePoints: values.length,
-      sampleDays:
-        (rows[rows.length - 1].ts.getTime() - rows[0].ts.getTime()) / 86_400_000,
+      sampleDays,
       min: sorted[0],
       max: sorted[sorted.length - 1],
       p10: pick(0.1),
@@ -686,10 +751,9 @@ app.get('/api/expected-move/daily', async (req: Request, res: Response) => {
       return res.status(503).json({ error: 'no future expirations available' });
     }
 
-    // Pick the nearest expiration. For the 1-day horizon, the nearest
-    // expiration's ATM IV is the cleanest market-implied volatility for today.
     rows.sort((a, b) => a.expirationTimestamp - b.expirationTimestamp);
-    const frontExp = rows[0].expiration;
+    const front = rows[0];
+    const frontExp = front.expiration;
     const frontRows = rows.filter((r) => r.expiration === frontExp);
     const forward = summary.find((s) => parseInstrument(s.instrument_name)?.expiration === frontExp)
       ?.underlying_price ?? indexPrice.index_price;
@@ -699,11 +763,27 @@ app.get('/api/expected-move/daily', async (req: Request, res: Response) => {
       return res.status(503).json({ error: 'atm iv not available' });
     }
 
-    const bands = expectedMoveBands(forward, atm, 1);
+    const frontHoursLeft = (front.expirationTimestamp - now) / 3_600_000;
+    const nextExpRow = rows.find((r) => r.expiration !== frontExp);
+    const nextExp = nextExpRow?.expiration ?? null;
+    const nextAtm = nextExpRow
+      ? atmIv(rows.filter((r) => r.expiration === nextExp), forward)
+      : null;
+
+    const bands = expectedMove24hBands(
+      forward,
+      atm,
+      frontHoursLeft,
+      frontExp,
+      nextAtm,
+      nextExp,
+    );
+    if (!bands) {
+      return res.status(503).json({ error: 'expected move not available' });
+    }
+
     res.json({
       ...bands,
-      expiration: frontExp,
-      forward,
       fetchedAt: Date.now(),
     });
   } catch (err) {

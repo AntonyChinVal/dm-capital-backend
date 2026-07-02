@@ -53,6 +53,7 @@ export interface SignalSnapshotPayload {
   skew90d: number | null;
   skew180d: number | null;
   gexNet: number | null;
+  gexUnit: string;
   gammaFlip: number | null;
   callWall: number | null;
   cascadeWall: number | null;

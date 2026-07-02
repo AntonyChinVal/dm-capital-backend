@@ -16,6 +16,11 @@ export interface GexInput {
   spot?: number;
 }
 
+export interface GexExpiryInput extends GexInput {
+  expiration: string;
+  expirationTimestamp: number;
+}
+
 export interface DexInput {
   strike: number;
   type: 'C' | 'P';
@@ -133,6 +138,96 @@ export function gexByStrike(rows: GexInput[], defaultSpot: number): GEXPoint[] {
     netGex: p.netExposure,
   }));
 }
+
+function gammaMagnitude(row: GexExpiryInput, defaultSpot: number): number {
+  const spot = row.spot ?? defaultSpot;
+  return Math.abs(row.gamma * row.openInterest * spot);
+}
+
+/**
+ * Per-expiry share of |gamma exposure| at a single strike.
+ * Reusable for OPEX mode and active-range release attribution.
+ */
+export function gammaShareByExpiry(
+  strike: number,
+  rows: GexExpiryInput[],
+  defaultSpot: number,
+): Record<string, number> {
+  const atStrike = rows.filter((r) => r.strike === strike && r.openInterest > 0);
+  const byExp = new Map<string, number>();
+  let total = 0;
+  for (const r of atStrike) {
+    const mag = gammaMagnitude(r, defaultSpot);
+    if (mag === 0) continue;
+    total += mag;
+    byExp.set(r.expiration, (byExp.get(r.expiration) ?? 0) + mag);
+  }
+  if (total === 0) return {};
+  const shares: Record<string, number> = {};
+  for (const [exp, mag] of byExp) {
+    shares[exp] = mag / total;
+  }
+  return shares;
+}
+
+export interface DominantGammaExpiry {
+  expiration: string;
+  expirationTimestamp: number;
+  sharePct: number;
+  hoursLeft: number;
+}
+
+const GAMMA_SHARE_DOMINANCE = 0.4;
+
+/**
+ * Aggregate |gamma| by expiry across all strikes in [putWall, callWall].
+ * Returns the expiry with the largest aggregated share when it clears 40%.
+ */
+export function dominantGammaExpiryInRange(
+  putWall: number,
+  callWall: number,
+  rows: GexExpiryInput[],
+  defaultSpot: number,
+  nowMs = Date.now(),
+): DominantGammaExpiry | null {
+  const low = Math.min(putWall, callWall);
+  const high = Math.max(putWall, callWall);
+  const strikes = [...new Set(rows.map((r) => r.strike).filter((s) => s >= low && s <= high))];
+  if (!strikes.length) return null;
+
+  const byExp = new Map<string, { mag: number; ts: number }>();
+  let total = 0;
+  for (const strike of strikes) {
+    for (const r of rows) {
+      if (r.strike !== strike || r.openInterest <= 0) continue;
+      const mag = gammaMagnitude(r, defaultSpot);
+      if (mag === 0) continue;
+      total += mag;
+      const cur = byExp.get(r.expiration) ?? { mag: 0, ts: r.expirationTimestamp };
+      cur.mag += mag;
+      byExp.set(r.expiration, cur);
+    }
+  }
+  if (total === 0) return null;
+
+  let best: { expiration: string; ts: number; share: number } | null = null;
+  for (const [expiration, { mag, ts }] of byExp) {
+    const share = mag / total;
+    if (!best || share > best.share) {
+      best = { expiration, ts, share };
+    }
+  }
+  if (!best || best.share < GAMMA_SHARE_DOMINANCE) return null;
+
+  return {
+    expiration: best.expiration,
+    expirationTimestamp: best.ts,
+    sharePct: best.share * 100,
+    hoursLeft: Math.max(0, (best.ts - nowMs) / 3_600_000),
+  };
+}
+
+export { GAMMA_SHARE_DOMINANCE };
 
 /**
  * DEX per strike (delta is already signed by option type).

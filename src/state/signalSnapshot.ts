@@ -4,7 +4,8 @@ import { getDvol } from './dvol.js';
 import { flowAggregator } from './aggregator.js';
 import { enqueueSignalSnapshot, type SignalSnapshotPayload } from './durableBatcher.js';
 
-const SIGNAL_SCHEMA_VERSION = 1;
+const SIGNAL_SCHEMA_VERSION = 2;
+const GEX_UNIT = 'usd_per_1usd_move' as const;
 const CONSTANT_TENORS = [7, 30, 90, 180] as const;
 
 type ConstantTenor = typeof CONSTANT_TENORS[number];
@@ -92,6 +93,7 @@ export function buildSignalSnapshot(
     dvol: finiteOrNull(dvol?.value),
     ...constantSkews(term),
     gexNet: finiteOrNull(bundle.macro.netGex),
+    gexUnit: GEX_UNIT,
     gammaFlip: finiteOrNull(bundle.macro.gammaFlip),
     callWall: finiteOrNull(bundle.macro.callWall),
     cascadeWall: finiteOrNull(bundle.macro.putWall),

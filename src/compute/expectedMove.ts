@@ -66,3 +66,79 @@ export function expectedMoveBands(
     sigma2: sigma1 * 2,
   };
 }
+
+const HOURS_PER_DAY = 24;
+const WINDOW_HOURS = 24;
+
+/**
+ * Forward-variance blend for the 24h horizon (Hernán 2026-07-02).
+ * When the front expiry has T1 < 24h left, the window splits: front covers T1,
+ * the next expiry covers the remainder. Variances are averaged, not IVs.
+ */
+export function blendedIv24h(
+  frontIvPercent: number,
+  frontHoursLeft: number,
+  nextIvPercent: number | null,
+): number {
+  const t1Hours = Math.min(Math.max(frontHoursLeft, 0), WINDOW_HOURS);
+  if (t1Hours >= WINDOW_HOURS || nextIvPercent == null || nextIvPercent <= 0) {
+    return frontIvPercent;
+  }
+  const w1 = t1Hours / WINDOW_HOURS;
+  const w2 = 1 - w1;
+  const v1 = (frontIvPercent / 100) ** 2;
+  const v2 = (nextIvPercent / 100) ** 2;
+  return Math.sqrt(w1 * v1 + w2 * v2) * 100;
+}
+
+export interface ExpectedMove24hMeta {
+  frontExpiration: string;
+  nextExpiration: string | null;
+  ivLabel: string;
+  blended: boolean;
+  frontHoursLeft: number;
+}
+
+export interface ExpectedMoveDailyBands extends ExpectedMoveBands {
+  expiration: string;
+  forward: number;
+  ivLabel: string;
+  blended: boolean;
+  frontExpiration: string;
+  nextExpiration: string | null;
+}
+
+/**
+ * 1σ expected move for the next 24h window with optional two-expiry IV blend.
+ */
+export function expectedMove24hBands(
+  spot: number,
+  frontIvPercent: number,
+  frontHoursLeft: number,
+  frontExpiration: string,
+  nextIvPercent: number | null,
+  nextExpiration: string | null,
+): ExpectedMoveDailyBands | null {
+  const blendedIv = blendedIv24h(frontIvPercent, frontHoursLeft, nextIvPercent);
+  const blended = frontHoursLeft < WINDOW_HOURS && nextIvPercent != null && nextIvPercent > 0;
+  const ivLabel = blended && nextExpiration
+    ? `IV blend ${frontExpiration}/${nextExpiration}`
+    : `IV from expiration ${frontExpiration}`;
+
+  const sigma1 = expectedMove(spot, blendedIv, 1);
+  if (sigma1 === 0) return null;
+
+  return {
+    spot,
+    atmIv: blendedIv,
+    daysToExpiry: 1,
+    sigma1,
+    sigma2: sigma1 * 2,
+    expiration: frontExpiration,
+    forward: spot,
+    ivLabel,
+    blended,
+    frontExpiration,
+    nextExpiration,
+  };
+}

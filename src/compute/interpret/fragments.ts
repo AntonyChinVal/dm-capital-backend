@@ -8,6 +8,7 @@
  */
 import type { NetFlowState, RegimenState, SesgoState } from './classifiers.js';
 import type { RangeTrendState } from './rangeTrend.js';
+import { callWallProximityCopy, proximityCopy, putWallProximityCopy } from './proximity.js';
 
 export interface Fragment {
   label: string;
@@ -114,8 +115,25 @@ export const RANGETREND_FRAGMENTS: Record<RangeTrendState, Fragment> = {
   },
 };
 
-/** Distance-aware regime subtext (descriptive only). */
-export function regimenSub(spot: number, flip: number, state: RegimenState): string {
+/** Distance-aware regime subtext in σ(EM daily) units. */
+export function regimenSub(
+  spot: number,
+  flip: number,
+  state: RegimenState,
+  em1sigmaDaily: number | null,
+): string {
+  if (em1sigmaDaily != null && em1sigmaDaily > 0) {
+    const base = proximityCopy(spot, flip, em1sigmaDaily, 'gamma flip');
+    const signLabel = state.startsWith('positive') ? 'positive' : 'negative';
+    if (state.endsWith('_amplio')) {
+      return `${base} — settled ${signLabel} gamma band.`;
+    }
+    if (state.endsWith('_ajustado')) {
+      return `${base} — transition band.`;
+    }
+    return base;
+  }
+
   const distPct = ((spot - flip) / spot) * 100;
   const sign = distPct >= 0 ? '+' : '';
   const dir = distPct >= 0 ? 'above' : 'below';
@@ -151,6 +169,21 @@ export function netflowSeverity(state: NetFlowState): Severity {
   if (state === 'unknown') return 'unknown';
   if (state === 'alcista_fuerte' || state === 'bajista_fuerte') return 'warn';
   return 'info';
+}
+
+export function rangetrendSub(
+  spot: number,
+  callWall: number,
+  putWall: number,
+  state: RangeTrendState,
+  em1sigmaDaily: number | null,
+): string {
+  if (em1sigmaDaily != null && em1sigmaDaily > 0) {
+    if (state === 'trend-up') return callWallProximityCopy(spot, callWall, em1sigmaDaily);
+    if (state === 'trend-down') return putWallProximityCopy(spot, putWall, em1sigmaDaily);
+    if (state === 'range') return 'Spot between the walls — mid-corridor.';
+  }
+  return RANGETREND_FRAGMENTS[state].sub;
 }
 
 export function rangetrendSeverity(state: RangeTrendState): Severity {
