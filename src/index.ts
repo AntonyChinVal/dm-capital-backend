@@ -8,6 +8,7 @@ import {
   fetchDvolLatest,
   fetchIndexPrice,
   getBookSummaryCacheStatus,
+  startBookSummaryWarmer,
 } from './deribit/rest.js';
 import { DeribitWS } from './deribit/ws.js';
 import { parseInstrument } from './compute/parseInstrument.js';
@@ -1146,6 +1147,7 @@ app.get('/api/alerts/stream', (req: Request, res: Response) => {
 
 app.listen(PORT, HOST, async () => {
   console.log(`[dm-capital-backend] listening on http://${HOST}:${PORT}`);
+  startBookSummaryWarmer(['BTC']);
   try {
     await dws.connect();
     await refreshSubscriptions();

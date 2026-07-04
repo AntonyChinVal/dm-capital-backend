@@ -1,9 +1,11 @@
 import type { BookSummary, DeribitEnvelope, IndexPrice } from '../types.js';
 
 const DERIBIT_REST = process.env.DERIBIT_REST ?? 'https://www.deribit.com/api/v2';
-const DEFAULT_BOOK_SUMMARY_CACHE_TTL_MS = 10_000;
-const DEFAULT_BOOK_SUMMARY_STALE_IF_ERROR_MS = 30_000;
+const DEFAULT_BOOK_SUMMARY_CACHE_TTL_MS = 15_000;
+const DEFAULT_BOOK_SUMMARY_STALE_MAX_MS = 120_000;
+const DEFAULT_BOOK_SUMMARY_STALE_IF_ERROR_MS = 60_000;
 const DEFAULT_BOOK_SUMMARY_CACHE_MAX_ENTRIES = 8;
+const DEFAULT_BOOK_SUMMARY_WARM_INTERVAL_MS = 8_000;
 
 function envNumber(name: string, fallback: number, min: number): number {
   const raw = process.env[name];
@@ -16,6 +18,11 @@ const BOOK_SUMMARY_CACHE_TTL_MS = envNumber(
   DEFAULT_BOOK_SUMMARY_CACHE_TTL_MS,
   0,
 );
+const BOOK_SUMMARY_STALE_MAX_MS = envNumber(
+  'DERIBIT_BOOK_SUMMARY_STALE_MAX_MS',
+  DEFAULT_BOOK_SUMMARY_STALE_MAX_MS,
+  0,
+);
 const BOOK_SUMMARY_STALE_IF_ERROR_MS = envNumber(
   'DERIBIT_BOOK_SUMMARY_STALE_IF_ERROR_MS',
   DEFAULT_BOOK_SUMMARY_STALE_IF_ERROR_MS,
@@ -23,6 +30,11 @@ const BOOK_SUMMARY_STALE_IF_ERROR_MS = envNumber(
 );
 const BOOK_SUMMARY_CACHE_MAX_ENTRIES = Math.trunc(
   envNumber('DERIBIT_BOOK_SUMMARY_CACHE_MAX_ENTRIES', DEFAULT_BOOK_SUMMARY_CACHE_MAX_ENTRIES, 1),
+);
+const BOOK_SUMMARY_WARM_INTERVAL_MS = envNumber(
+  'DERIBIT_BOOK_SUMMARY_WARM_INTERVAL_MS',
+  DEFAULT_BOOK_SUMMARY_WARM_INTERVAL_MS,
+  1_000,
 );
 
 interface BookSummaryCacheEntry {
@@ -33,6 +45,7 @@ interface BookSummaryCacheEntry {
 }
 
 const bookSummaryCache = new Map<string, BookSummaryCacheEntry>();
+let bookSummaryWarmerStarted = false;
 
 function ensureBookSummaryCacheCapacity(currency: string): void {
   if (bookSummaryCache.has(currency) || bookSummaryCache.size < BOOK_SUMMARY_CACHE_MAX_ENTRIES) {
@@ -70,20 +83,27 @@ async function call<T>(method: string, params: Record<string, string | number>):
   return envelope.result;
 }
 
-export function fetchBookSummary(currency = 'BTC'): Promise<BookSummary[]> {
-  const normalizedCurrency = currency.toUpperCase();
-  if (BOOK_SUMMARY_CACHE_TTL_MS === 0) {
-    return call<BookSummary[]>('public/get_book_summary_by_currency', {
-      currency: normalizedCurrency,
-      kind: 'option',
-    });
-  }
+function storeBookSummaryCache(
+  normalizedCurrency: string,
+  value: BookSummary[],
+  prior?: BookSummaryCacheEntry,
+): void {
+  const fetchedAt = Date.now();
+  ensureBookSummaryCacheCapacity(normalizedCurrency);
+  bookSummaryCache.set(normalizedCurrency, {
+    value,
+    fetchedAt,
+    expiresAt: fetchedAt + BOOK_SUMMARY_CACHE_TTL_MS,
+    inFlight: prior?.inFlight,
+  });
+}
 
-  const now = Date.now();
+function refreshBookSummaryInBackground(normalizedCurrency: string): void {
+  void refreshBookSummary(normalizedCurrency);
+}
+
+function refreshBookSummary(normalizedCurrency: string): Promise<BookSummary[]> {
   const cached = bookSummaryCache.get(normalizedCurrency);
-  if (cached?.value && cached.expiresAt > now) {
-    return Promise.resolve(cached.value);
-  }
   if (cached?.inFlight) {
     return cached.inFlight;
   }
@@ -93,13 +113,7 @@ export function fetchBookSummary(currency = 'BTC'): Promise<BookSummary[]> {
     kind: 'option',
   })
     .then((value) => {
-      const fetchedAt = Date.now();
-      ensureBookSummaryCacheCapacity(normalizedCurrency);
-      bookSummaryCache.set(normalizedCurrency, {
-        value,
-        fetchedAt,
-        expiresAt: fetchedAt + BOOK_SUMMARY_CACHE_TTL_MS,
-      });
+      storeBookSummaryCache(normalizedCurrency, value);
       return value;
     })
     .catch((err) => {
@@ -130,11 +144,64 @@ export function fetchBookSummary(currency = 'BTC'): Promise<BookSummary[]> {
   return request;
 }
 
+export function fetchBookSummary(currency = 'BTC'): Promise<BookSummary[]> {
+  const normalizedCurrency = currency.toUpperCase();
+  if (BOOK_SUMMARY_CACHE_TTL_MS === 0) {
+    return call<BookSummary[]>('public/get_book_summary_by_currency', {
+      currency: normalizedCurrency,
+      kind: 'option',
+    });
+  }
+
+  const now = Date.now();
+  const cached = bookSummaryCache.get(normalizedCurrency);
+
+  if (cached?.value && cached.expiresAt > now) {
+    return Promise.resolve(cached.value);
+  }
+
+  // Stale-while-revalidate: never block live reads on Deribit when we have recent data.
+  if (
+    cached?.value &&
+    cached.fetchedAt != null &&
+    now - cached.fetchedAt <= BOOK_SUMMARY_STALE_MAX_MS
+  ) {
+    refreshBookSummaryInBackground(normalizedCurrency);
+    return Promise.resolve(cached.value);
+  }
+
+  return refreshBookSummary(normalizedCurrency);
+}
+
+export function startBookSummaryWarmer(currencies: string[] = ['BTC']): void {
+  if (bookSummaryWarmerStarted || BOOK_SUMMARY_CACHE_TTL_MS === 0) {
+    return;
+  }
+  bookSummaryWarmerStarted = true;
+
+  const warm = () => {
+    for (const currency of currencies) {
+      const normalizedCurrency = currency.toUpperCase();
+      const entry = bookSummaryCache.get(normalizedCurrency);
+      const now = Date.now();
+      if (entry?.inFlight) continue;
+      if (!entry?.value || entry.expiresAt <= now) {
+        refreshBookSummaryInBackground(normalizedCurrency);
+      }
+    }
+  };
+
+  warm();
+  setInterval(warm, BOOK_SUMMARY_WARM_INTERVAL_MS);
+}
+
 export function getBookSummaryCacheStatus() {
   const now = Date.now();
   return {
     ttlMs: BOOK_SUMMARY_CACHE_TTL_MS,
+    staleMaxMs: BOOK_SUMMARY_STALE_MAX_MS,
     staleIfErrorMs: BOOK_SUMMARY_STALE_IF_ERROR_MS,
+    warmIntervalMs: BOOK_SUMMARY_WARM_INTERVAL_MS,
     maxEntries: BOOK_SUMMARY_CACHE_MAX_ENTRIES,
     entries: [...bookSummaryCache.entries()].map(([currency, entry]) => ({
       currency,
@@ -142,6 +209,7 @@ export function getBookSummaryCacheStatus() {
       fetchedAt: entry.fetchedAt,
       ageMs: entry.fetchedAt == null ? null : now - entry.fetchedAt,
       expiresInMs: Math.max(0, entry.expiresAt - now),
+      stale: Boolean(entry.value && entry.expiresAt <= now),
       inFlight: Boolean(entry.inFlight),
     })),
   };
