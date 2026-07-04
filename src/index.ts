@@ -3,7 +3,12 @@ import cors from 'cors';
 import { statfs } from 'node:fs/promises';
 import { prisma } from './db.js';
 import { durablePrisma } from './db/durable.js';
-import { fetchBookSummary, fetchDvolLatest, fetchIndexPrice } from './deribit/rest.js';
+import {
+  fetchBookSummary,
+  fetchDvolLatest,
+  fetchIndexPrice,
+  getBookSummaryCacheStatus,
+} from './deribit/rest.js';
 import { DeribitWS } from './deribit/ws.js';
 import { parseInstrument } from './compute/parseInstrument.js';
 import {
@@ -282,6 +287,7 @@ app.get('/api/health', async (_req: Request, res: Response) => {
     lastDurableFlushAt: durable.lastFlushAt,
     durableFlushIntervalMs: durable.flushIntervalMs,
     durableError: durable.lastFlushError,
+    deribitBookSummaryCache: getBookSummaryCacheStatus(),
     dataDisk,
     opsStatus,
     opsAlerts,

@@ -1,6 +1,50 @@
 import type { BookSummary, DeribitEnvelope, IndexPrice } from '../types.js';
 
 const DERIBIT_REST = process.env.DERIBIT_REST ?? 'https://www.deribit.com/api/v2';
+const DEFAULT_BOOK_SUMMARY_CACHE_TTL_MS = 10_000;
+const DEFAULT_BOOK_SUMMARY_STALE_IF_ERROR_MS = 30_000;
+const DEFAULT_BOOK_SUMMARY_CACHE_MAX_ENTRIES = 8;
+
+function envNumber(name: string, fallback: number, min: number): number {
+  const raw = process.env[name];
+  const value = raw == null || raw === '' ? fallback : Number(raw);
+  return Number.isFinite(value) ? Math.max(min, value) : fallback;
+}
+
+const BOOK_SUMMARY_CACHE_TTL_MS = envNumber(
+  'DERIBIT_BOOK_SUMMARY_CACHE_TTL_MS',
+  DEFAULT_BOOK_SUMMARY_CACHE_TTL_MS,
+  0,
+);
+const BOOK_SUMMARY_STALE_IF_ERROR_MS = envNumber(
+  'DERIBIT_BOOK_SUMMARY_STALE_IF_ERROR_MS',
+  DEFAULT_BOOK_SUMMARY_STALE_IF_ERROR_MS,
+  0,
+);
+const BOOK_SUMMARY_CACHE_MAX_ENTRIES = Math.trunc(
+  envNumber('DERIBIT_BOOK_SUMMARY_CACHE_MAX_ENTRIES', DEFAULT_BOOK_SUMMARY_CACHE_MAX_ENTRIES, 1),
+);
+
+interface BookSummaryCacheEntry {
+  value?: BookSummary[];
+  fetchedAt: number | null;
+  expiresAt: number;
+  inFlight?: Promise<BookSummary[]>;
+}
+
+const bookSummaryCache = new Map<string, BookSummaryCacheEntry>();
+
+function ensureBookSummaryCacheCapacity(currency: string): void {
+  if (bookSummaryCache.has(currency) || bookSummaryCache.size < BOOK_SUMMARY_CACHE_MAX_ENTRIES) {
+    return;
+  }
+
+  const oldestCurrency = [...bookSummaryCache.entries()]
+    .sort(([, a], [, b]) => (a.fetchedAt ?? 0) - (b.fetchedAt ?? 0))[0]?.[0];
+  if (oldestCurrency) {
+    bookSummaryCache.delete(oldestCurrency);
+  }
+}
 
 async function call<T>(method: string, params: Record<string, string | number>): Promise<T> {
   const url = new URL(`${DERIBIT_REST}/${method}`);
@@ -27,10 +71,80 @@ async function call<T>(method: string, params: Record<string, string | number>):
 }
 
 export function fetchBookSummary(currency = 'BTC'): Promise<BookSummary[]> {
-  return call<BookSummary[]>('public/get_book_summary_by_currency', {
-    currency,
+  const normalizedCurrency = currency.toUpperCase();
+  if (BOOK_SUMMARY_CACHE_TTL_MS === 0) {
+    return call<BookSummary[]>('public/get_book_summary_by_currency', {
+      currency: normalizedCurrency,
+      kind: 'option',
+    });
+  }
+
+  const now = Date.now();
+  const cached = bookSummaryCache.get(normalizedCurrency);
+  if (cached?.value && cached.expiresAt > now) {
+    return Promise.resolve(cached.value);
+  }
+  if (cached?.inFlight) {
+    return cached.inFlight;
+  }
+
+  const request = call<BookSummary[]>('public/get_book_summary_by_currency', {
+    currency: normalizedCurrency,
     kind: 'option',
+  })
+    .then((value) => {
+      const fetchedAt = Date.now();
+      ensureBookSummaryCacheCapacity(normalizedCurrency);
+      bookSummaryCache.set(normalizedCurrency, {
+        value,
+        fetchedAt,
+        expiresAt: fetchedAt + BOOK_SUMMARY_CACHE_TTL_MS,
+      });
+      return value;
+    })
+    .catch((err) => {
+      if (
+        cached?.value &&
+        cached.fetchedAt != null &&
+        Date.now() - cached.fetchedAt <= BOOK_SUMMARY_STALE_IF_ERROR_MS
+      ) {
+        return cached.value;
+      }
+      throw err;
+    })
+    .finally(() => {
+      const entry = bookSummaryCache.get(normalizedCurrency);
+      if (entry?.inFlight === request) {
+        bookSummaryCache.set(normalizedCurrency, { ...entry, inFlight: undefined });
+      }
+    });
+
+  ensureBookSummaryCacheCapacity(normalizedCurrency);
+  bookSummaryCache.set(normalizedCurrency, {
+    value: cached?.value,
+    fetchedAt: cached?.fetchedAt ?? null,
+    expiresAt: cached?.expiresAt ?? 0,
+    inFlight: request,
   });
+
+  return request;
+}
+
+export function getBookSummaryCacheStatus() {
+  const now = Date.now();
+  return {
+    ttlMs: BOOK_SUMMARY_CACHE_TTL_MS,
+    staleIfErrorMs: BOOK_SUMMARY_STALE_IF_ERROR_MS,
+    maxEntries: BOOK_SUMMARY_CACHE_MAX_ENTRIES,
+    entries: [...bookSummaryCache.entries()].map(([currency, entry]) => ({
+      currency,
+      rows: entry.value?.length ?? 0,
+      fetchedAt: entry.fetchedAt,
+      ageMs: entry.fetchedAt == null ? null : now - entry.fetchedAt,
+      expiresInMs: Math.max(0, entry.expiresAt - now),
+      inFlight: Boolean(entry.inFlight),
+    })),
+  };
 }
 
 export function fetchIndexPrice(indexName = 'btc_usd'): Promise<IndexPrice> {
