@@ -38,6 +38,7 @@ import {
   checkStructuralFear,
   checkWallApproach,
 } from './compute/signals.js';
+import { cachedResponse, getResponseCacheStatus } from './cache/responseCache.js';
 import { classifyTrade, type DeribitTrade } from './compute/tradeFlow.js';
 import { flowAggregator, flowWindowMeta } from './state/aggregator.js';
 import { alertStream } from './state/alerts.js';
@@ -289,6 +290,7 @@ app.get('/api/health', async (_req: Request, res: Response) => {
     durableFlushIntervalMs: durable.flushIntervalMs,
     durableError: durable.lastFlushError,
     deribitBookSummaryCache: getBookSummaryCacheStatus(),
+    apiResponseCache: getResponseCacheStatus(),
     dataDisk,
     opsStatus,
     opsAlerts,
@@ -473,132 +475,140 @@ app.get('/api/synthesis', async (req: Request, res: Response) => {
     const window = String(req.query.window ?? '1h').toLowerCase();
     const windowMinutes = window === '4h' ? 240 : window === '24h' ? 1440 : 60;
 
-    const [indexPrice, summary] = await Promise.all([
-      fetchIndexPrice(indexName),
-      fetchBookSummary(currency),
-    ]);
+    const payload = await cachedResponse(
+      `synthesis:${currency}:${expiration}:${window}`,
+      async () => {
+        const [indexPrice, summary] = await Promise.all([
+          fetchIndexPrice(indexName),
+          fetchBookSummary(currency),
+        ]);
 
-    const allRows = parseBookRows(summary);
-    const expRows = allRows.filter((r) => r.expiration === expiration);
-    if (!expRows.length) {
-      return res.status(404).json({ error: `no instruments for expiration ${expiration}` });
-    }
+        const allRows = parseBookRows(summary);
+        const expRows = allRows.filter((r) => r.expiration === expiration);
+        if (!expRows.length) {
+          throw new Error(`no instruments for expiration ${expiration}`);
+        }
 
-    const bundle = computeMetricsBundle(
-      allRows,
-      expiration,
-      'market',
-      indexPrice.index_price,
-    );
-    if (!bundle) {
-      return res.status(404).json({ error: `no instruments for expiration ${expiration}` });
-    }
+        const bundle = computeMetricsBundle(
+          allRows,
+          expiration,
+          'market',
+          indexPrice.index_price,
+        );
+        if (!bundle) {
+          throw new Error(`no instruments for expiration ${expiration}`);
+        }
 
-    const skewTermAll = buildSkewTermStructure(allRows, { maxTenors: 'all' });
-    const headlineSkew = pickHeadlineSkew(skewTermAll);
-    const headlineSkew30d = pickHeadlineSkew30d(skewTermAll);
-    const skewTiles = pickSkewTiles(skewTermAll);
+        const skewTermAll = buildSkewTermStructure(allRows, { maxTenors: 'all' });
+        const headlineSkew = pickHeadlineSkew(skewTermAll);
+        const headlineSkew30d = pickHeadlineSkew30d(skewTermAll);
+        const skewTiles = pickSkewTiles(skewTermAll);
 
-    // Net flow for the requested window
-    const flowNet = flowAggregator.netForWindow(windowMinutes);
+        const flowNet = flowAggregator.netForWindow(windowMinutes);
 
-    // Next OPEX for the bridge text — first non-daily expiration
-    const nextOpex = (() => {
-      const all = [...new Set(allRows.map((r) => r.expiration))]
-        .map((exp) => {
-          const r = allRows.find((x) => x.expiration === exp);
-          return r ? { expiration: exp, ts: r.expirationTimestamp } : null;
-        })
-        .filter((x): x is { expiration: string; ts: number } => x !== null)
-        .filter((x) => x.ts > Date.now())
-        .sort((a, b) => a.ts - b.ts);
-      for (const e of all) {
-        const tag = classifyExpiration(e.ts);
-        if (tag === 'M' || tag === 'Q') return { expiration: e.expiration, tag };
-      }
-      return null;
-    })();
+        const nextOpex = (() => {
+          const all = [...new Set(allRows.map((r) => r.expiration))]
+            .map((exp) => {
+              const r = allRows.find((x) => x.expiration === exp);
+              return r ? { expiration: exp, ts: r.expirationTimestamp } : null;
+            })
+            .filter((x): x is { expiration: string; ts: number } => x !== null)
+            .filter((x) => x.ts > Date.now())
+            .sort((a, b) => a.ts - b.ts);
+          for (const e of all) {
+            const tag = classifyExpiration(e.ts);
+            if (tag === 'M' || tag === 'Q') return { expiration: e.expiration, tag };
+          }
+          return null;
+        })();
 
-    const nowMs = Date.now();
-    const localPut = bundle.local.support;
-    const localCall = bundle.local.resistance;
-    const liquidBook = filterLiquidStrikes(allRows);
-    const gexExpiryRows = toGexExpiryRows(liquidBook, nowMs);
-    const dominant =
-      localPut != null && localCall != null
-        ? dominantGammaExpiryInRange(
-            localPut,
-            localCall,
-            gexExpiryRows,
-            indexPrice.index_price,
-            nowMs,
-          )
-        : null;
+        const nowMs = Date.now();
+        const localPut = bundle.local.support;
+        const localCall = bundle.local.resistance;
+        const liquidBook = filterLiquidStrikes(allRows);
+        const gexExpiryRows = toGexExpiryRows(liquidBook, nowMs);
+        const dominant =
+          localPut != null && localCall != null
+            ? dominantGammaExpiryInRange(
+                localPut,
+                localCall,
+                gexExpiryRows,
+                indexPrice.index_price,
+                nowMs,
+              )
+            : null;
 
-    const emDaily = (() => {
-      const futureRows = liquidBook
-        .filter((r) => r.expirationTimestamp > nowMs)
-        .sort((a, b) => a.expirationTimestamp - b.expirationTimestamp);
-      if (!futureRows.length) return null;
-      const front = futureRows[0];
-      const frontRows = futureRows.filter((r) => r.expiration === front.expiration);
-      const forward = front.underlyingPrice;
-      const frontAtm = atmIv(frontRows, forward);
-      if (frontAtm == null) return null;
-      const frontHoursLeft = (front.expirationTimestamp - nowMs) / 3_600_000;
-      const nextRow = futureRows.find((r) => r.expiration !== front.expiration);
-      const nextAtm = nextRow
-        ? atmIv(futureRows.filter((r) => r.expiration === nextRow.expiration), forward)
-        : null;
-      return expectedMove24hBands(
-        forward,
-        frontAtm,
-        frontHoursLeft,
-        front.expiration,
-        nextAtm,
-        nextRow?.expiration ?? null,
-      );
-    })();
+        const emDaily = (() => {
+          const futureRows = liquidBook
+            .filter((r) => r.expirationTimestamp > nowMs)
+            .sort((a, b) => a.expirationTimestamp - b.expirationTimestamp);
+          if (!futureRows.length) return null;
+          const front = futureRows[0];
+          const frontRows = futureRows.filter((r) => r.expiration === front.expiration);
+          const forward = front.underlyingPrice;
+          const frontAtm = atmIv(frontRows, forward);
+          if (frontAtm == null) return null;
+          const frontHoursLeft = (front.expirationTimestamp - nowMs) / 3_600_000;
+          const nextRow = futureRows.find((r) => r.expiration !== front.expiration);
+          const nextAtm = nextRow
+            ? atmIv(futureRows.filter((r) => r.expiration === nextRow.expiration), forward)
+            : null;
+          return expectedMove24hBands(
+            forward,
+            frontAtm,
+            frontHoursLeft,
+            front.expiration,
+            nextAtm,
+            nextRow?.expiration ?? null,
+          );
+        })();
 
-    const panorama = buildPanorama({
-      spot: indexPrice.index_price,
-      gammaFlip: bundle.macro.gammaFlip,
-      callWall: bundle.macro.callWall,
-      putWall: bundle.macro.putWall,
-      headlineSkew,
-      signedNotional: flowNet.signedNotional,
-      deltaFlowUsd: flowNet.deltaFlowUsd,
-      em1sigmaDaily: emDaily?.sigma1 ?? null,
-    });
+        const panorama = buildPanorama({
+          spot: indexPrice.index_price,
+          gammaFlip: bundle.macro.gammaFlip,
+          callWall: bundle.macro.callWall,
+          putWall: bundle.macro.putWall,
+          headlineSkew,
+          signedNotional: flowNet.signedNotional,
+          deltaFlowUsd: flowNet.deltaFlowUsd,
+          em1sigmaDaily: emDaily?.sigma1 ?? null,
+        });
 
-    const bridge = buildBridgeText(localCall, localPut, { dominant, nextOpex });
+        const bridge = buildBridgeText(localCall, localPut, { dominant, nextOpex });
 
-    res.json({
-      currency,
-      expiration,
-      window,
-      fetchedAt: Date.now(),
-      spot: indexPrice.index_price,
-      future: bundle.future,
-      macro: bundle.macro,
-      panorama,
-      bridgeText: bridge.text,
-      bridgeCritical: bridge.critical,
-      skewTiles,
-      headlineSkew,
-      headlineSkew30d,
-      flowNet: {
-        window,
-        signedNotional: flowNet.signedNotional,
-        deltaFlowUsd: flowNet.deltaFlowUsd,
-        deltaCount: flowNet.deltaCount,
-        vegaFlowUsd: flowNet.vegaFlowUsd,
-        vegaCount: flowNet.vegaCount,
-        bucketsUsed: flowNet.bucketsUsed,
+        return {
+          currency,
+          expiration,
+          window,
+          fetchedAt: Date.now(),
+          spot: indexPrice.index_price,
+          future: bundle.future,
+          macro: bundle.macro,
+          panorama,
+          bridgeText: bridge.text,
+          bridgeCritical: bridge.critical,
+          skewTiles,
+          headlineSkew,
+          headlineSkew30d,
+          flowNet: {
+            window,
+            signedNotional: flowNet.signedNotional,
+            deltaFlowUsd: flowNet.deltaFlowUsd,
+            deltaCount: flowNet.deltaCount,
+            vegaFlowUsd: flowNet.vegaFlowUsd,
+            vegaCount: flowNet.vegaCount,
+            bucketsUsed: flowNet.bucketsUsed,
+          },
+        };
       },
-    });
+    );
+    res.json(payload);
   } catch (err) {
-    res.status(502).json({ error: err instanceof Error ? err.message : String(err) });
+    const message = err instanceof Error ? err.message : String(err);
+    if (message.startsWith('no instruments for expiration')) {
+      return res.status(404).json({ error: message });
+    }
+    res.status(502).json({ error: message });
   }
 });
 
@@ -823,28 +833,31 @@ app.get('/api/totals', async (req: Request, res: Response) => {
   try {
     const currency = typeof req.query.currency === 'string' ? req.query.currency : 'BTC';
     const indexName = currency === 'BTC' ? 'btc_usd' : 'eth_usd';
-    const [indexPrice, data] = await Promise.all([
-      fetchIndexPrice(indexName),
-      fetchBookSummary(currency),
-    ]);
-    let notionalUsd = 0;
-    let contracts = 0;
-    for (const row of data) {
-      const oi = row.open_interest ?? 0;
-      const px = row.underlying_price ?? 0;
-      contracts += oi;
-      notionalUsd += oi * px;
-    }
-    const allRows = parseBookRows(data);
-    const ratios = computeMarketRatios(allRows, indexPrice.index_price);
-    res.json({
-      currency,
-      contracts,
-      notionalUsd,
-      instrumentCount: data.length,
-      ...ratios,
-      fetchedAt: Date.now(),
+    const payload = await cachedResponse(`totals:${currency}`, async () => {
+      const [indexPrice, data] = await Promise.all([
+        fetchIndexPrice(indexName),
+        fetchBookSummary(currency),
+      ]);
+      let notionalUsd = 0;
+      let contracts = 0;
+      for (const row of data) {
+        const oi = row.open_interest ?? 0;
+        const px = row.underlying_price ?? 0;
+        contracts += oi;
+        notionalUsd += oi * px;
+      }
+      const allRows = parseBookRows(data);
+      const ratios = computeMarketRatios(allRows, indexPrice.index_price);
+      return {
+        currency,
+        contracts,
+        notionalUsd,
+        instrumentCount: data.length,
+        ...ratios,
+        fetchedAt: Date.now(),
+      };
     });
+    res.json(payload);
   } catch (err) {
     res.status(502).json({ error: err instanceof Error ? err.message : String(err) });
   }
@@ -965,73 +978,83 @@ app.get('/api/metrics', async (req: Request, res: Response) => {
     const scopeParam = String(req.query.scope ?? 'market').toLowerCase();
     const scope = scopeParam === 'expiration' ? 'expiration' : 'market';
 
-    const [indexPrice, data] = await Promise.all([
-      fetchIndexPrice(indexName),
-      fetchBookSummary(currency),
-    ]);
+    const payload = await cachedResponse(
+      `metrics:${currency}:${expiration}:${scope}`,
+      async () => {
+        const [indexPrice, data] = await Promise.all([
+          fetchIndexPrice(indexName),
+          fetchBookSummary(currency),
+        ]);
 
-    const allRows = parseBookRows(data);
-    const bundle = computeMetricsBundle(
-      allRows,
-      expiration,
-      scope,
-      indexPrice.index_price,
-      Date.now(),
-      { cascadeHysteresisKey: currency },
+        const allRows = parseBookRows(data);
+        const bundle = computeMetricsBundle(
+          allRows,
+          expiration,
+          scope,
+          indexPrice.index_price,
+          Date.now(),
+          { cascadeHysteresisKey: currency },
+        );
+        if (!bundle) {
+          throw new Error(`no instruments for expiration ${expiration}`);
+        }
+
+        const expiryLevels = computeMetricsBundle(
+          allRows,
+          expiration,
+          'expiration',
+          indexPrice.index_price,
+        );
+
+        alertStream.push(checkFlipCross(expiration, bundle.future, expiryLevels?.gammaFlip ?? null));
+        alertStream.push(
+          checkWallApproach(
+            expiration,
+            bundle.future,
+            expiryLevels?.local.resistance ?? null,
+            expiryLevels?.local.support ?? null,
+          ),
+        );
+
+        return {
+          currency,
+          expiration,
+          scope: bundle.scope,
+          fetchedAt: Date.now(),
+          future: bundle.future,
+          count: bundle.count,
+          maxPain: bundle.maxPain,
+          oi: bundle.oi,
+          volume: bundle.volume,
+          volOi: bundle.volOi,
+          keyStrikes: bundle.keyStrikes,
+          ivCurve: bundle.ivCurve,
+          gex: bundle.gex,
+          dex: bundle.dex,
+          dexSummary: bundle.dexSummary,
+          vex: bundle.vex,
+          vexSummary: bundle.vexSummary,
+          gexCovered: bundle.gexCovered,
+          dexCovered: bundle.dexCovered,
+          vexCovered: bundle.vexCovered,
+          gammaFlip: bundle.gammaFlip,
+          callWall: bundle.callWall,
+          putWall: bundle.putWall,
+          regime: bundle.regime,
+          expectedMove: bundle.expectedMove,
+          macro: bundle.macro,
+          local: bundle.local,
+          walls: bundle.walls,
+        };
+      },
     );
-    if (!bundle) {
-      return res.status(404).json({ error: `no instruments for expiration ${expiration}` });
-    }
-
-    const expiryLevels = computeMetricsBundle(
-      allRows,
-      expiration,
-      'expiration',
-      indexPrice.index_price,
-    );
-
-    alertStream.push(checkFlipCross(expiration, bundle.future, expiryLevels?.gammaFlip ?? null));
-    alertStream.push(
-      checkWallApproach(
-        expiration,
-        bundle.future,
-        expiryLevels?.local.resistance ?? null,
-        expiryLevels?.local.support ?? null,
-      ),
-    );
-
-    res.json({
-      currency,
-      expiration,
-      scope: bundle.scope,
-      fetchedAt: Date.now(),
-      future: bundle.future,
-      count: bundle.count,
-      maxPain: bundle.maxPain,
-      oi: bundle.oi,
-      volume: bundle.volume,
-      volOi: bundle.volOi,
-      keyStrikes: bundle.keyStrikes,
-      ivCurve: bundle.ivCurve,
-      gex: bundle.gex,
-      dex: bundle.dex,
-      dexSummary: bundle.dexSummary,
-      vex: bundle.vex,
-      vexSummary: bundle.vexSummary,
-      gexCovered: bundle.gexCovered,
-      dexCovered: bundle.dexCovered,
-      vexCovered: bundle.vexCovered,
-      gammaFlip: bundle.gammaFlip,
-      callWall: bundle.callWall,
-      putWall: bundle.putWall,
-      regime: bundle.regime,
-      expectedMove: bundle.expectedMove,
-      macro: bundle.macro,
-      local: bundle.local,
-      walls: bundle.walls,
-    });
+    res.json(payload);
   } catch (err) {
-    res.status(502).json({ error: err instanceof Error ? err.message : String(err) });
+    const message = err instanceof Error ? err.message : String(err);
+    if (message.startsWith('no instruments for expiration')) {
+      return res.status(404).json({ error: message });
+    }
+    res.status(502).json({ error: message });
   }
 });
 
@@ -1041,75 +1064,76 @@ app.get('/api/surface', async (req: Request, res: Response) => {
     const tenors = Math.max(2, Math.min(8, Number(req.query.tenors ?? 8)));
     const axis = req.query.axis === 'delta' ? 'delta' : 'strike';
 
-    const data = await fetchBookSummary(currency);
-    const allRows = parseBookRows(data);
-    const liquid = filterLiquidStrikes(allRows);
-    const curveLiquid = filterCurveStrikes(liquid);
-    const surfaceInput = curveLiquid.map((r) => ({
-      instrument: r.instrument,
-      strike: r.strike,
-      type: r.type,
-      markIv: r.markIv,
-      expiration: r.expiration,
-      expirationTimestamp: r.expirationTimestamp,
-      underlyingPrice: r.underlyingPrice,
-      interestRate: r.interestRate,
-    }));
+    const payload = await cachedResponse(`surface:${currency}:${axis}:${tenors}`, async () => {
+      const data = await fetchBookSummary(currency);
+      const allRows = parseBookRows(data);
+      const liquid = filterLiquidStrikes(allRows);
+      const curveLiquid = filterCurveStrikes(liquid);
+      const surfaceInput = curveLiquid.map((r) => ({
+        instrument: r.instrument,
+        strike: r.strike,
+        type: r.type,
+        markIv: r.markIv,
+        expiration: r.expiration,
+        expirationTimestamp: r.expirationTimestamp,
+        underlyingPrice: r.underlyingPrice,
+        interestRate: r.interestRate,
+      }));
 
-    const termStructure = buildSkewTermStructure(allRows, {
-      maxTenors: 'all',
-      excludeZeroDte: true,
-    });
-    const atmTermStructure = buildAtmTermStructure(allRows);
+      const termStructure = buildSkewTermStructure(allRows, {
+        maxTenors: 'all',
+        excludeZeroDte: true,
+      });
+      const atmTermStructure = buildAtmTermStructure(allRows);
 
-    // Phase 5: structural-fear rule
-    alertStream.push(checkStructuralFear(termStructure));
+      alertStream.push(checkStructuralFear(termStructure));
 
-    const shared = {
-      currency,
-      fetchedAt: Date.now(),
-      axis,
-      termStructure,
-      atmTermStructure,
-      headlineSkew: pickHeadlineSkew(termStructure),
-      headlineSkew30d: pickHeadlineSkew30d(
-        buildSkewTermStructure(allRows, { maxTenors: 'all' }),
-      ),
-    };
+      const shared = {
+        currency,
+        fetchedAt: Date.now(),
+        axis,
+        termStructure,
+        atmTermStructure,
+        headlineSkew: pickHeadlineSkew(termStructure),
+        headlineSkew30d: pickHeadlineSkew30d(
+          buildSkewTermStructure(allRows, { maxTenors: 'all' }),
+        ),
+      };
 
-    if (axis === 'delta') {
-      const surface = buildSurfaceByDelta(surfaceInput, tenors);
-      res.json({
+      if (axis === 'delta') {
+        const surface = buildSurfaceByDelta(surfaceInput, tenors);
+        return {
+          ...shared,
+          deltas: surface.columns.map((c) => c.index),
+          deltaColumns: surface.columns.map(({ rawDelta, label, hoverLabel }) => ({
+            rawDelta,
+            label,
+            hoverLabel,
+          })),
+          strikes: [],
+          expirations: surface.rows.map((sr) => ({
+            expiration: sr.expiration,
+            timestamp: sr.expirationTimestamp,
+            tenorDays: sr.tenorDays,
+          })),
+          iv: surface.rows.map((sr) => sr.iv),
+        };
+      }
+
+      const surface = buildSurface(surfaceInput, tenors);
+      return {
         ...shared,
-        deltas: surface.columns.map((c) => c.index),
-        deltaColumns: surface.columns.map(({ rawDelta, label, hoverLabel }) => ({
-          rawDelta,
-          label,
-          hoverLabel,
-        })),
-        strikes: [],
+        strikes: surface.strikes,
+        deltas: [],
         expirations: surface.rows.map((sr) => ({
           expiration: sr.expiration,
           timestamp: sr.expirationTimestamp,
           tenorDays: sr.tenorDays,
         })),
         iv: surface.rows.map((sr) => sr.iv),
-      });
-      return;
-    }
-
-    const surface = buildSurface(surfaceInput, tenors);
-    res.json({
-      ...shared,
-      strikes: surface.strikes,
-      deltas: [],
-      expirations: surface.rows.map((sr) => ({
-        expiration: sr.expiration,
-        timestamp: sr.expirationTimestamp,
-        tenorDays: sr.tenorDays,
-      })),
-      iv: surface.rows.map((sr) => sr.iv),
+      };
     });
+    res.json(payload);
   } catch (err) {
     res.status(502).json({ error: err instanceof Error ? err.message : String(err) });
   }
@@ -1235,6 +1259,7 @@ async function snapshotAllMetrics(): Promise<void> {
         count: bundle.count,
         gexCovered: bundle.gexCovered,
       });
+      await new Promise<void>((resolve) => setImmediate(resolve));
     }
   } catch (err) {
     console.error('[persist] metric snapshot batch failed', err);
