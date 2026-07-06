@@ -1,5 +1,6 @@
 import express, { type Request, type Response } from 'express';
 import cors from 'cors';
+import { requireAccessKey, isAuthRequired } from './auth.js';
 import { statfs } from 'node:fs/promises';
 import { prisma } from './db.js';
 import { durablePrisma } from './db/durable.js';
@@ -66,7 +67,28 @@ const DATA_DIR = process.env.DATA_DIR ?? '/data';
 const OPS_ALERT_LOG_INTERVAL_MS = 5 * 60_000;
 
 const app = express();
-app.use(cors());
+app.use(
+  cors({
+    allowedHeaders: ['Content-Type', 'X-Access-Key', 'Authorization'],
+  }),
+);
+
+// ACCESS_KEY env (when set) gates every /api route except Fly liveness.
+app.use((req, res, next) => {
+  if (req.method === 'OPTIONS') {
+    next();
+    return;
+  }
+  if (!req.path.startsWith('/api/') && req.path !== '/api') {
+    next();
+    return;
+  }
+  if (req.path === '/api/live' || req.path === '/api/auth/config') {
+    next();
+    return;
+  }
+  requireAccessKey(req, res, next);
+});
 
 const dws = new DeribitWS();
 
@@ -74,6 +96,10 @@ const dws = new DeribitWS();
 // independent from DB/disk probes; /api/health remains the richer ops endpoint.
 app.get('/api/live', (_req: Request, res: Response) => {
   res.json({ ok: true, ts: Date.now() });
+});
+
+app.get('/api/auth/config', (_req: Request, res: Response) => {
+  res.json({ authRequired: isAuthRequired() });
 });
 
 dws.onTrade((raw) => {
