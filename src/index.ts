@@ -49,6 +49,7 @@ import { readIndexHistory, readMetricHistory } from './state/historyReader.js';
 import { getDvol, updateDvol } from './state/dvol.js';
 import { getGreeks, greeksCount, greeksWithGamma, updateGreeks } from './state/greeks.js';
 import { persistSignalSnapshot } from './state/signalSnapshot.js';
+import { updateDiskGuard, getDiskGuardStatus } from './state/diskGuard.js';
 import { tradeStream } from './state/trades.js';
 import {
   persistAggregateSnapshot,
@@ -304,6 +305,15 @@ function buildOpsAlerts(dataDisk: DiskUsage, durable: ReturnType<typeof getDurab
     });
   }
 
+  const diskGuard = getDiskGuardStatus();
+  if (!diskGuard.mirrorWritesEnabled && diskGuard.lastUsedPercent != null) {
+    alerts.push({
+      code: 'local_mirror_paused',
+      severity: 'warning',
+      message: `local mirror paused — /data at ${diskGuard.lastUsedPercent}%`,
+    });
+  }
+
   return alerts;
 }
 
@@ -324,6 +334,7 @@ app.get('/api/health', async (_req: Request, res: Response) => {
   const dvol = getDvol('btc_usd');
   const durable = getDurableStatus();
   const dataDisk = await getDiskUsage(DATA_DIR);
+  updateDiskGuard(dataDisk.usedPercent);
   const opsAlerts = buildOpsAlerts(dataDisk, durable);
   const opsStatus: OpsSeverity = opsAlerts.some((alert) => alert.severity === 'critical')
     ? 'critical'
@@ -357,6 +368,7 @@ app.get('/api/health', async (_req: Request, res: Response) => {
     deribitBookSummaryCache: getBookSummaryCacheStatus(),
     apiResponseCache: getResponseCacheStatus(),
     dataDisk,
+    diskGuard: getDiskGuardStatus(),
     opsStatus,
     opsAlerts,
   });
@@ -1411,6 +1423,7 @@ async function pruneOldHistory(): Promise<void> {
       `[persist] pruned durable ${RETENTION_DAYS}d: metrics=${durableMetrics.count} surface=${durableSurface.count} alerts=${durableAlerts.count} ticks=${durableTicks.count} · durable flow ${FLOW_TRADE_RETENTION_DAYS}d=${durableTrades.count} · durable dvol ${DVOL_RETENTION_DAYS}d=${durableDvol.count} · sqlite local ${LOCAL_HISTORY_MAX_HOURS}h: metrics=${legacyMetrics.count} surface=${legacySurface.count} trades=${legacyTrades.count} alerts=${legacyAlerts.count} ticks=${legacyTicks.count} dvol=${legacyDvol.count} signal=${legacySignals.count} · aggregate ${FLOW_AGGREGATE_RETENTION_HOURS}h=${aggs.count}`,
     );
     const dataDisk = await getDiskUsage(DATA_DIR);
+    updateDiskGuard(dataDisk.usedPercent);
     await runSqliteMaintenanceIfNeeded(dataDisk);
   } catch (err) {
     console.error('[persist] prune failed', err);
@@ -1447,5 +1460,14 @@ function startPersistenceTimers(): void {
   setInterval(pruneOldHistory, 24 * 60 * 60_000);
   setTimeout(pruneOldHistory, 60_000);
 
-  console.log('[persist] timers started: indexTick=30s · dvol=60s · signal=60s · metric/surface=5m · aggregate=60s · prune=24h');
+  // Disk guard — refresh mirror pause threshold every 5 min
+  const refreshDiskGuard = () => {
+    getDiskUsage(DATA_DIR)
+      .then((disk) => updateDiskGuard(disk.usedPercent))
+      .catch((err) => console.error('[disk-guard] refresh failed', err));
+  };
+  setInterval(refreshDiskGuard, 5 * 60_000);
+  setTimeout(refreshDiskGuard, 5_000);
+
+  console.log('[persist] timers started: indexTick=30s · dvol=60s · signal=60s · metric/surface=5m · aggregate=60s · prune=24h · diskGuard=5m');
 }

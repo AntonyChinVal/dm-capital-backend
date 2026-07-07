@@ -16,6 +16,7 @@ import { prisma as localPrisma } from '../db.js';
 const DEFAULT_FLUSH_INTERVAL_MS = 10 * 60_000;
 const OUTBOX_TTL_MS = 48 * 60 * 60_000;
 const MAX_FLUSH_ROWS = 500;
+const PRIORITY_OUTBOX_KINDS = new Set<DurableKind>(['signalSnapshot', 'dvolTick']);
 
 export const PERSIST_FLUSH_INTERVAL_MS = Number(
   process.env.PERSIST_FLUSH_INTERVAL_MS ?? DEFAULT_FLUSH_INTERVAL_MS,
@@ -411,11 +412,23 @@ async function writeOutboxRow(row: { id: string; kind: string; payload: string }
   throw new Error(`unknown durable outbox kind: ${row.kind}`);
 }
 
+function prioritizeOutboxRows<T extends { kind: string; createdAt: Date }>(rows: T[]): T[] {
+  return [...rows]
+    .sort((a, b) => {
+      const aPriority = PRIORITY_OUTBOX_KINDS.has(a.kind as DurableKind) ? 0 : 1;
+      const bPriority = PRIORITY_OUTBOX_KINDS.has(b.kind as DurableKind) ? 0 : 1;
+      if (aPriority !== bPriority) return aPriority - bPriority;
+      return a.createdAt.getTime() - b.createdAt.getTime();
+    })
+    .slice(0, MAX_FLUSH_ROWS);
+}
+
 export async function flushDurableBatch(): Promise<void> {
-  const rows = await localPrisma.durableOutbox.findMany({
+  const pending = await localPrisma.durableOutbox.findMany({
     orderBy: { createdAt: 'asc' },
-    take: MAX_FLUSH_ROWS,
+    take: MAX_FLUSH_ROWS * 2,
   });
+  const rows = prioritizeOutboxRows(pending);
   if (!rows.length) {
     status.localDb = 'ok';
     await refreshOutboxStatus();

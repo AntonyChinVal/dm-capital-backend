@@ -5,12 +5,14 @@ import type {
   MetricSnapshotPayload,
   SignalSnapshotPayload,
 } from './durableBatcher.js';
+import { isLocalMirrorEnabled } from './diskGuard.js';
 
 function logErr(label: string) {
   return (err: unknown) => console.error(`[local-mirror] ${label} failed`, err);
 }
 
 export function mirrorMetricSnapshot(payload: MetricSnapshotPayload): void {
+  if (!isLocalMirrorEnabled()) return;
   prisma.metricSnapshot.create({
     data: {
       ts: new Date(payload.ts),
@@ -32,6 +34,7 @@ export function mirrorMetricSnapshot(payload: MetricSnapshotPayload): void {
 }
 
 export function mirrorIndexTick(payload: IndexTickPayload): void {
+  if (!isLocalMirrorEnabled()) return;
   prisma.indexTick.upsert({
     where: { ts: new Date(payload.ts) },
     create: {
@@ -47,6 +50,7 @@ export function mirrorIndexTick(payload: IndexTickPayload): void {
 }
 
 export function mirrorDvolTick(payload: DvolTickPayload): void {
+  if (!isLocalMirrorEnabled()) return;
   prisma.dvolTick.upsert({
     where: { ts_currency: { ts: new Date(payload.ts), currency: payload.currency } },
     create: {
@@ -61,6 +65,7 @@ export function mirrorDvolTick(payload: DvolTickPayload): void {
 }
 
 export function mirrorSignalSnapshot(payload: SignalSnapshotPayload): void {
+  if (!isLocalMirrorEnabled()) return;
   prisma.signalSnapshot.upsert({
     where: { ts_currency: { ts: new Date(payload.ts), currency: payload.currency } },
     create: {
