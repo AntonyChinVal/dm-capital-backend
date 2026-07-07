@@ -1,10 +1,11 @@
 import { buildSkewTermStructure, computeMetricsBundle, parseBookRows } from '../compute/metricsBundle.js';
+import { buildIvGridByConstantTenor } from '../compute/ivGridByTenor.js';
 import type { BookSummary } from '../types.js';
 import { getDvol } from './dvol.js';
 import { flowAggregator } from './aggregator.js';
 import { enqueueSignalSnapshot, type SignalSnapshotPayload } from './durableBatcher.js';
 
-const SIGNAL_SCHEMA_VERSION = 2;
+const SIGNAL_SCHEMA_VERSION = 3;
 const GEX_UNIT = 'usd_per_1usd_move' as const;
 const CONSTANT_TENORS = [7, 30, 90, 180] as const;
 
@@ -84,6 +85,7 @@ export function buildSignalSnapshot(
   }, now);
   const flow1m = flowAggregator.netForWindow(1, now);
   const dvol = getDvol('btc_usd');
+  const ivGridByDelta = buildIvGridByConstantTenor(allRows, now);
 
   return {
     schemaVersion: SIGNAL_SCHEMA_VERSION,
@@ -92,6 +94,7 @@ export function buildSignalSnapshot(
     spot: finiteOrNull(spot),
     dvol: finiteOrNull(dvol?.value),
     ...constantSkews(term),
+    ivGridByDelta,
     gexNet: finiteOrNull(bundle.macro.netGex),
     gexUnit: GEX_UNIT,
     gammaFlip: finiteOrNull(bundle.macro.gammaFlip),

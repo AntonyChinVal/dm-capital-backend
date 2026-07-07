@@ -144,6 +144,9 @@ model SignalSnapshot {
   /// Regime label displayed by the terminal. NULL until rules exist.
   regimeLabel    String?
 
+  /// IV grid at constant tenors (7D/30D/90D/180D) × 7 deltas. Vol %. schema v3+.
+  ivGridByDelta  Json?
+
   @@id([ts, currency])
   @@index([currency, ts])
 }

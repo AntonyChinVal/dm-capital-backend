@@ -1,5 +1,12 @@
 import { durablePrisma } from '../db/durable.js';
 import { Prisma } from '../generated/durable-client/index.js';
+import type { IvGridByDelta } from '../compute/ivGridByTenor.js';
+import {
+  mirrorDvolTick,
+  mirrorIndexTick,
+  mirrorMetricSnapshot,
+  mirrorSignalSnapshot,
+} from './localMirror.js';
 // Outbox lives in the same SQLite file the legacy client owns. Reuse that single
 // client to avoid two Prisma engines opening one SQLite file (lock contention →
 // "disk I/O error"). When legacy SQLite tables are fully retired, this can move
@@ -27,6 +34,7 @@ export interface DurableStatus {
   durableDb: 'ok' | 'degraded' | 'unknown';
   localDb: 'ok' | 'degraded' | 'unknown';
   pendingOutbox: number;
+  staleOutbox: number;
   oldestPendingOutboxAt: number | null;
   oldestPendingOutboxAgeMs: number | null;
   lastDvolWrite: number | null;
@@ -63,6 +71,7 @@ export interface SignalSnapshotPayload {
   flowVegaNet: number | null;
   flowPremiumNet: number | null;
   regimeLabel: string | null;
+  ivGridByDelta: IvGridByDelta | null;
 }
 
 export interface MetricSnapshotPayload {
@@ -136,6 +145,7 @@ const status: DurableStatus = {
   durableDb: 'unknown',
   localDb: 'unknown',
   pendingOutbox: 0,
+  staleOutbox: 0,
   oldestPendingOutboxAt: null,
   oldestPendingOutboxAgeMs: null,
   lastDvolWrite: null,
@@ -199,28 +209,35 @@ async function enqueue<K extends DurableKind>(
   status.oldestPendingOutboxAgeMs = status.oldestPendingOutboxAt == null ? null : Date.now() - status.oldestPendingOutboxAt;
 }
 
-async function refreshOutboxStatus(): Promise<void> {
-  const [pendingOutbox, oldest] = await Promise.all([
+async function refreshOutboxStatus(now = Date.now()): Promise<void> {
+  const cutoff = new Date(now - OUTBOX_TTL_MS);
+  const [pendingOutbox, oldest, staleOutbox] = await Promise.all([
     localPrisma.durableOutbox.count(),
     localPrisma.durableOutbox.findFirst({
       orderBy: { createdAt: 'asc' },
       select: { createdAt: true },
     }),
+    localPrisma.durableOutbox.count({
+      where: { createdAt: { lt: cutoff } },
+    }),
   ]);
   const oldestPendingOutboxAt = oldest?.createdAt.getTime() ?? null;
   status.pendingOutbox = pendingOutbox;
+  status.staleOutbox = staleOutbox;
   status.oldestPendingOutboxAt = oldestPendingOutboxAt;
-  status.oldestPendingOutboxAgeMs = oldestPendingOutboxAt == null ? null : Date.now() - oldestPendingOutboxAt;
+  status.oldestPendingOutboxAgeMs = oldestPendingOutboxAt == null ? null : now - oldestPendingOutboxAt;
 }
 
 export function enqueueDvolTick(value: number, currency = 'BTC', ts = new Date()): void {
   if (!Number.isFinite(value) || value <= 0) return;
   const minute = minuteDate(ts);
-  enqueue('dvolTick', {
+  const payload = {
     ts: minute.getTime(),
     currency,
     value,
-  }).catch((err: unknown) => {
+  };
+  mirrorDvolTick(payload);
+  enqueue('dvolTick', payload).catch((err: unknown) => {
     status.localDb = 'degraded';
     console.error('[persist] dvolTick outbox failed', err);
   });
@@ -228,16 +245,19 @@ export function enqueueDvolTick(value: number, currency = 'BTC', ts = new Date()
 
 export function enqueueSignalSnapshot(payload: SignalSnapshotPayload): void {
   const minute = minuteDate(new Date(payload.ts));
-  enqueue('signalSnapshot', {
+  const normalized = {
     ...payload,
     ts: minute.getTime(),
-  }).catch((err: unknown) => {
+  };
+  mirrorSignalSnapshot(normalized);
+  enqueue('signalSnapshot', normalized).catch((err: unknown) => {
     status.localDb = 'degraded';
     console.error('[persist] signalSnapshot outbox failed', err);
   });
 }
 
 export function enqueueMetricSnapshot(payload: MetricSnapshotPayload): void {
+  mirrorMetricSnapshot(payload);
   enqueue('metricSnapshot', payload).catch((err: unknown) => {
     status.localDb = 'degraded';
     console.error('[persist] metricSnapshot outbox failed', err);
@@ -266,6 +286,7 @@ export function enqueueAlertLog(payload: AlertLogPayload): void {
 }
 
 export function enqueueIndexTick(payload: IndexTickPayload): void {
+  mirrorIndexTick(payload);
   enqueue('indexTick', payload).catch((err: unknown) => {
     status.localDb = 'degraded';
     console.error('[persist] indexTick outbox failed', err);
@@ -288,16 +309,15 @@ async function writeDvol(payload: DvolTickPayload): Promise<void> {
 }
 
 async function writeSignal(payload: SignalSnapshotPayload): Promise<void> {
+  const data = {
+    ...payload,
+    ts: new Date(payload.ts),
+    ivGridByDelta: payload.ivGridByDelta ?? Prisma.JsonNull,
+  };
   await durablePrisma.signalSnapshot.upsert({
     where: { ts_currency: { ts: new Date(payload.ts), currency: payload.currency } },
-    create: {
-      ...payload,
-      ts: new Date(payload.ts),
-    },
-    update: {
-      ...payload,
-      ts: new Date(payload.ts),
-    },
+    create: data,
+    update: data,
   });
   status.lastSignalWrite = Date.now();
 }
@@ -441,9 +461,20 @@ export async function flushDurableBatch(): Promise<void> {
 
 export async function pruneOutbox(now = new Date()): Promise<void> {
   const cutoff = new Date(now.getTime() - OUTBOX_TTL_MS);
-  await localPrisma.durableOutbox.deleteMany({
+  const stale = await localPrisma.durableOutbox.count({
     where: { createdAt: { lt: cutoff } },
   });
+  status.staleOutbox = stale;
+  if (stale > 0) {
+    console.warn('[ops-alert]', JSON.stringify({
+      ts: Date.now(),
+      alerts: [{
+        code: 'outbox_ttl_exceeded',
+        severity: 'critical',
+        message: `${stale} durable outbox row(s) older than 48h were not flushed to Neon — not deleted`,
+      }],
+    }));
+  }
 }
 
 export async function refreshDurableStatus(): Promise<DurableStatus> {

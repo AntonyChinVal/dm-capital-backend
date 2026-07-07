@@ -40,10 +40,12 @@ import {
   checkWallApproach,
 } from './compute/signals.js';
 import { cachedResponse, getResponseCacheStatus } from './cache/responseCache.js';
+import { computeMetricsBundleCached } from './cache/metricsBundleCache.js';
 import { classifyTrade, type DeribitTrade } from './compute/tradeFlow.js';
 import { flowAggregator, flowWindowMeta } from './state/aggregator.js';
 import { alertStream } from './state/alerts.js';
 import { getDurableStatus, startDurableBatcher } from './state/durableBatcher.js';
+import { readIndexHistory, readMetricHistory } from './state/historyReader.js';
 import { getDvol, updateDvol } from './state/dvol.js';
 import { getGreeks, greeksCount, greeksWithGamma, updateGreeks } from './state/greeks.js';
 import { persistSignalSnapshot } from './state/signalSnapshot.js';
@@ -65,6 +67,17 @@ const FLOW_STREAM_MIN_BTC = Number(process.env.FLOW_STREAM_MIN_BTC ?? 1);
 const FLOW_AGG_MIN_BTC = Number(process.env.FLOW_AGG_MIN_BTC ?? 0.1);
 const DATA_DIR = process.env.DATA_DIR ?? '/data';
 const OPS_ALERT_LOG_INTERVAL_MS = 5 * 60_000;
+
+function installProcessCrashHandlers(): void {
+  const fatal = (label: string, err: unknown) => {
+    console.error(`[dm-capital-backend] ${label}`, err);
+    process.exit(1);
+  };
+  process.on('uncaughtException', (err) => fatal('uncaughtException', err));
+  process.on('unhandledRejection', (reason) => fatal('unhandledRejection', reason));
+}
+
+installProcessCrashHandlers();
 
 const app = express();
 app.use(
@@ -96,6 +109,23 @@ const dws = new DeribitWS();
 // independent from DB/disk probes; /api/health remains the richer ops endpoint.
 app.get('/api/live', (_req: Request, res: Response) => {
   res.json({ ok: true, ts: Date.now() });
+});
+
+// Lightweight status for frontend polling — no disk statfs or Neon probe.
+app.get('/api/status', (_req: Request, res: Response) => {
+  const dvol = getDvol('btc_usd');
+  res.json({
+    ok: true,
+    ts: Date.now(),
+    ws: dws.isOpen(),
+    subscriptions: dws.subscribedCount(),
+    greeks: greeksCount(),
+    greeksWithGamma: greeksWithGamma(),
+    trades: tradeStream.size(),
+    alerts: alertStream.size(),
+    dvol: dvol?.value ?? null,
+    dvolAge: dvol ? Date.now() - dvol.ts : null,
+  });
 });
 
 app.get('/api/auth/config', (_req: Request, res: Response) => {
@@ -266,6 +296,14 @@ function buildOpsAlerts(dataDisk: DiskUsage, durable: ReturnType<typeof getDurab
     });
   }
 
+  if (durable.staleOutbox > 0) {
+    alerts.push({
+      code: 'outbox_ttl_exceeded',
+      severity: 'critical',
+      message: `${durable.staleOutbox} durable outbox row(s) older than 48h not flushed to Neon`,
+    });
+  }
+
   return alerts;
 }
 
@@ -308,6 +346,7 @@ app.get('/api/health', async (_req: Request, res: Response) => {
     durableDb: durable.durableDb,
     localDb: durable.localDb,
     pendingOutbox: durable.pendingOutbox,
+    staleOutbox: durable.staleOutbox,
     oldestPendingOutboxAt: durable.oldestPendingOutboxAt,
     oldestPendingOutboxAgeMs: durable.oldestPendingOutboxAgeMs,
     lastDvolWrite: durable.lastDvolWrite,
@@ -336,20 +375,7 @@ app.get('/api/history/metrics', async (req: Request, res: Response) => {
     const hours = Number.isFinite(hoursParam) ? Math.max(1, Math.min(720, hoursParam)) : 6;
     const since = new Date(Date.now() - hours * 60 * 60_000);
 
-    const rows = await durablePrisma.metricSnapshot.findMany({
-      where: { currency, expiration, ts: { gte: since } },
-      orderBy: { ts: 'asc' },
-      select: {
-        ts: true,
-        future: true,
-        maxPain: true,
-        gammaFlip: true,
-        callWall: true,
-        putWall: true,
-        regime: true,
-        atmIv: true,
-      },
-    });
+    const { rows, source } = await readMetricHistory(currency, expiration, since, hours);
 
     // Phase 11 B11.4 — explicit readiness flag so the frontend can hide
     // sparklines while the system is warming up.
@@ -362,6 +388,7 @@ app.get('/api/history/metrics', async (req: Request, res: Response) => {
       currency,
       expiration,
       hours,
+      source,
       ready,
       minutesCollected,
       minutesRequired: REQUIRED_MIN_MINUTES,
@@ -387,14 +414,11 @@ app.get('/api/history/index', async (req: Request, res: Response) => {
     const hoursParam = Number(req.query.hours ?? 6);
     const hours = Number.isFinite(hoursParam) ? Math.max(1, Math.min(720, hoursParam)) : 6;
     const since = new Date(Date.now() - hours * 60 * 60_000);
-    const rows = await durablePrisma.indexTick.findMany({
-      where: { indexName, ts: { gte: since } },
-      orderBy: { ts: 'asc' },
-      select: { ts: true, price: true },
-    });
+    const { rows, source } = await readIndexHistory(indexName, since, hours);
     res.json({
       indexName,
       hours,
+      source,
       points: rows.map((r) => ({ ts: r.ts.getTime(), price: r.price })),
     });
   } catch (err) {
@@ -515,7 +539,8 @@ app.get('/api/synthesis', async (req: Request, res: Response) => {
           throw new Error(`no instruments for expiration ${expiration}`);
         }
 
-        const bundle = computeMetricsBundle(
+        const bundle = computeMetricsBundleCached(
+          currency,
           allRows,
           expiration,
           'market',
@@ -773,64 +798,70 @@ app.get('/api/expected-move/daily', async (req: Request, res: Response) => {
     const currency = typeof req.query.currency === 'string' ? req.query.currency : 'BTC';
     const indexName = currency === 'BTC' ? 'btc_usd' : 'eth_usd';
 
-    const [indexPrice, summary] = await Promise.all([
-      fetchIndexPrice(indexName),
-      fetchBookSummary(currency),
-    ]);
+    const payload = await cachedResponse(`expected-move:daily:${currency}`, async () => {
+      const [indexPrice, summary] = await Promise.all([
+        fetchIndexPrice(indexName),
+        fetchBookSummary(currency),
+      ]);
 
-    const now = Date.now();
-    const rows = summary
-      .map((row) => {
-        const p = parseInstrument(row.instrument_name);
-        if (!p || p.expirationTimestamp <= now) return null;
-        return {
-          ...p,
-          markIv: row.mark_iv ?? 0,
-        };
-      })
-      .filter((r): r is NonNullable<typeof r> => r !== null);
+      const now = Date.now();
+      const rows = summary
+        .map((row) => {
+          const p = parseInstrument(row.instrument_name);
+          if (!p || p.expirationTimestamp <= now) return null;
+          return {
+            ...p,
+            markIv: row.mark_iv ?? 0,
+          };
+        })
+        .filter((r): r is NonNullable<typeof r> => r !== null);
 
-    if (!rows.length) {
-      return res.status(503).json({ error: 'no future expirations available' });
-    }
+      if (!rows.length) {
+        throw new Error('no future expirations available');
+      }
 
-    rows.sort((a, b) => a.expirationTimestamp - b.expirationTimestamp);
-    const front = rows[0];
-    const frontExp = front.expiration;
-    const frontRows = rows.filter((r) => r.expiration === frontExp);
-    const forward = summary.find((s) => parseInstrument(s.instrument_name)?.expiration === frontExp)
-      ?.underlying_price ?? indexPrice.index_price;
+      rows.sort((a, b) => a.expirationTimestamp - b.expirationTimestamp);
+      const front = rows[0];
+      const frontExp = front.expiration;
+      const frontRows = rows.filter((r) => r.expiration === frontExp);
+      const forward = summary.find((s) => parseInstrument(s.instrument_name)?.expiration === frontExp)
+        ?.underlying_price ?? indexPrice.index_price;
 
-    const atm = atmIv(frontRows, forward);
-    if (atm == null) {
-      return res.status(503).json({ error: 'atm iv not available' });
-    }
+      const atm = atmIv(frontRows, forward);
+      if (atm == null) {
+        throw new Error('atm iv not available');
+      }
 
-    const frontHoursLeft = (front.expirationTimestamp - now) / 3_600_000;
-    const nextExpRow = rows.find((r) => r.expiration !== frontExp);
-    const nextExp = nextExpRow?.expiration ?? null;
-    const nextAtm = nextExpRow
-      ? atmIv(rows.filter((r) => r.expiration === nextExp), forward)
-      : null;
+      const frontHoursLeft = (front.expirationTimestamp - now) / 3_600_000;
+      const nextExpRow = rows.find((r) => r.expiration !== frontExp);
+      const nextExp = nextExpRow?.expiration ?? null;
+      const nextAtm = nextExpRow
+        ? atmIv(rows.filter((r) => r.expiration === nextExp), forward)
+        : null;
 
-    const bands = expectedMove24hBands(
-      forward,
-      atm,
-      frontHoursLeft,
-      frontExp,
-      nextAtm,
-      nextExp,
-    );
-    if (!bands) {
-      return res.status(503).json({ error: 'expected move not available' });
-    }
+      const bands = expectedMove24hBands(
+        forward,
+        atm,
+        frontHoursLeft,
+        frontExp,
+        nextAtm,
+        nextExp,
+      );
+      if (!bands) {
+        throw new Error('expected move not available');
+      }
 
-    res.json({
-      ...bands,
-      fetchedAt: Date.now(),
+      return {
+        ...bands,
+        fetchedAt: Date.now(),
+      };
     });
+
+    res.json(payload);
   } catch (err) {
-    res.status(502).json({ error: err instanceof Error ? err.message : String(err) });
+    const message = err instanceof Error ? err.message : String(err);
+    const status = message.includes('not available') || message.includes('no future') ? 503 : 502;
+    res.status(status).json({ error: message });
   }
 });
 
@@ -838,18 +869,21 @@ app.get('/api/expected-move/table', async (req: Request, res: Response) => {
   try {
     const currency = typeof req.query.currency === 'string' ? req.query.currency : 'BTC';
     const indexName = currency === 'BTC' ? 'btc_usd' : 'eth_usd';
-    const [indexPrice, summary] = await Promise.all([
-      fetchIndexPrice(indexName),
-      fetchBookSummary(currency),
-    ]);
-    const allRows = parseBookRows(summary);
-    const rows = buildExpectedMoveTable(allRows, indexPrice.index_price);
-    res.json({
-      currency,
-      spot: indexPrice.index_price,
-      rows,
-      fetchedAt: Date.now(),
+    const payload = await cachedResponse(`expected-move:table:${currency}`, async () => {
+      const [indexPrice, summary] = await Promise.all([
+        fetchIndexPrice(indexName),
+        fetchBookSummary(currency),
+      ]);
+      const allRows = parseBookRows(summary);
+      const rows = buildExpectedMoveTable(allRows, indexPrice.index_price);
+      return {
+        currency,
+        spot: indexPrice.index_price,
+        rows,
+        fetchedAt: Date.now(),
+      };
     });
+    res.json(payload);
   } catch (err) {
     res.status(502).json({ error: err instanceof Error ? err.message : String(err) });
   }
@@ -924,8 +958,11 @@ app.get('/api/flow/stream', (req: Request, res: Response) => {
 app.get('/api/index', async (req: Request, res: Response) => {
   try {
     const indexName = typeof req.query.name === 'string' ? req.query.name : 'btc_usd';
-    const data = await fetchIndexPrice(indexName);
-    res.json(data);
+    const payload = await cachedResponse(
+      `index:${indexName}`,
+      () => fetchIndexPrice(indexName),
+    );
+    res.json(payload);
   } catch (err) {
     res.status(502).json({ error: err instanceof Error ? err.message : String(err) });
   }
@@ -949,45 +986,48 @@ app.get('/api/options', async (req: Request, res: Response) => {
 app.get('/api/expirations', async (req: Request, res: Response) => {
   try {
     const currency = typeof req.query.currency === 'string' ? req.query.currency : 'BTC';
-    const data = await fetchBookSummary(currency);
+    const payload = await cachedResponse(`expirations:${currency}`, async () => {
+      const data = await fetchBookSummary(currency);
 
-    // Aggregate per expiration: timestamp, notional (Σ OI × underlying_price), counts
-    interface Agg {
-      timestamp: number;
-      notionalUsd: number;
-      contracts: number;
-      count: number;
-    }
-    const agg = new Map<string, Agg>();
-    for (const row of data) {
-      const p = parseInstrument(row.instrument_name);
-      if (!p) continue;
-      const bucket = agg.get(p.expiration) ?? {
-        timestamp: p.expirationTimestamp,
-        notionalUsd: 0,
-        contracts: 0,
-        count: 0,
-      };
-      bucket.contracts += row.open_interest ?? 0;
-      bucket.notionalUsd += (row.open_interest ?? 0) * (row.underlying_price ?? 0);
-      bucket.count += 1;
-      agg.set(p.expiration, bucket);
-    }
+      // Aggregate per expiration: timestamp, notional (Σ OI × underlying_price), counts
+      interface Agg {
+        timestamp: number;
+        notionalUsd: number;
+        contracts: number;
+        count: number;
+      }
+      const agg = new Map<string, Agg>();
+      for (const row of data) {
+        const p = parseInstrument(row.instrument_name);
+        if (!p) continue;
+        const bucket = agg.get(p.expiration) ?? {
+          timestamp: p.expirationTimestamp,
+          notionalUsd: 0,
+          contracts: 0,
+          count: 0,
+        };
+        bucket.contracts += row.open_interest ?? 0;
+        bucket.notionalUsd += (row.open_interest ?? 0) * (row.underlying_price ?? 0);
+        bucket.count += 1;
+        agg.set(p.expiration, bucket);
+      }
 
-    const now = Date.now();
-    const list = [...agg.entries()]
-      .filter(([, a]) => a.timestamp > now)
-      .sort((a, b) => a[1].timestamp - b[1].timestamp)
-      .map(([expiration, a]) => ({
-        expiration,
-        timestamp: a.timestamp,
-        tag: classifyExpiration(a.timestamp),
-        notionalUsd: a.notionalUsd,
-        contracts: a.contracts,
-        count: a.count,
-      }));
+      const now = Date.now();
+      const list = [...agg.entries()]
+        .filter(([, a]) => a.timestamp > now)
+        .sort((a, b) => a[1].timestamp - b[1].timestamp)
+        .map(([expiration, a]) => ({
+          expiration,
+          timestamp: a.timestamp,
+          tag: classifyExpiration(a.timestamp),
+          notionalUsd: a.notionalUsd,
+          contracts: a.contracts,
+          count: a.count,
+        }));
 
-    res.json({ currency, expirations: list });
+      return { currency, expirations: list };
+    });
+    res.json(payload);
   } catch (err) {
     res.status(502).json({ error: err instanceof Error ? err.message : String(err) });
   }
@@ -1013,7 +1053,8 @@ app.get('/api/metrics', async (req: Request, res: Response) => {
         ]);
 
         const allRows = parseBookRows(data);
-        const bundle = computeMetricsBundle(
+        const bundle = computeMetricsBundleCached(
+          currency,
           allRows,
           expiration,
           scope,
@@ -1025,7 +1066,8 @@ app.get('/api/metrics', async (req: Request, res: Response) => {
           throw new Error(`no instruments for expiration ${expiration}`);
         }
 
-        const expiryLevels = computeMetricsBundle(
+        const expiryLevels = computeMetricsBundleCached(
+          currency,
           allRows,
           expiration,
           'expiration',
@@ -1235,7 +1277,8 @@ app.listen(PORT, HOST, async () => {
 // Phase 11 · Persistence timers
 // =============================================================================
 
-const RETENTION_DAYS = Number(process.env.HISTORY_RETENTION_DAYS ?? 90);
+const RETENTION_DAYS = Number(process.env.HISTORY_RETENTION_DAYS ?? 180);
+const LOCAL_HISTORY_MAX_HOURS = Number(process.env.LOCAL_HISTORY_MAX_HOURS ?? 72);
 const DVOL_RETENTION_DAYS = Number(process.env.DVOL_RETENTION_DAYS ?? 365);
 const FLOW_TRADE_RETENTION_DAYS = Number(process.env.FLOW_TRADE_RETENTION_DAYS ?? 30);
 const FLOW_AGGREGATE_RETENTION_HOURS = Number(process.env.FLOW_AGGREGATE_RETENTION_HOURS ?? 48);
@@ -1328,6 +1371,7 @@ async function snapshotSignal(): Promise<void> {
 
 async function pruneOldHistory(): Promise<void> {
   const cutoff = new Date(Date.now() - RETENTION_DAYS * 86_400_000);
+  const localCutoff = new Date(Date.now() - LOCAL_HISTORY_MAX_HOURS * 60 * 60_000);
   const dvolCutoff = new Date(Date.now() - DVOL_RETENTION_DAYS * 86_400_000);
   const flowTradeCutoff = new Date(Date.now() - FLOW_TRADE_RETENTION_DAYS * 86_400_000);
   const aggregateCutoff = new Date(Date.now() - FLOW_AGGREGATE_RETENTION_HOURS * 60 * 60_000);
@@ -1338,8 +1382,9 @@ async function pruneOldHistory(): Promise<void> {
       legacyTrades,
       legacyAlerts,
       legacyTicks,
-      aggs,
       legacyDvol,
+      legacySignals,
+      aggs,
       durableMetrics,
       durableSurface,
       durableTrades,
@@ -1347,14 +1392,14 @@ async function pruneOldHistory(): Promise<void> {
       durableTicks,
       durableDvol,
     ] = await Promise.all([
-      // SQLite is now cache/outbox only. Clear legacy historical tables entirely.
-      prisma.metricSnapshot.deleteMany({}),
-      prisma.surfaceSnapshot.deleteMany({}),
-      prisma.flowTrade.deleteMany({}),
-      prisma.alertLog.deleteMany({}),
-      prisma.indexTick.deleteMany({}),
+      prisma.metricSnapshot.deleteMany({ where: { ts: { lt: localCutoff } } }),
+      prisma.surfaceSnapshot.deleteMany({ where: { ts: { lt: localCutoff } } }),
+      prisma.flowTrade.deleteMany({ where: { ts: { lt: flowTradeCutoff } } }),
+      prisma.alertLog.deleteMany({ where: { firstSeen: { lt: localCutoff } } }),
+      prisma.indexTick.deleteMany({ where: { ts: { lt: localCutoff } } }),
+      prisma.dvolTick.deleteMany({ where: { ts: { lt: localCutoff } } }),
+      prisma.signalSnapshot.deleteMany({ where: { ts: { lt: localCutoff } } }),
       prisma.flowAggregateSnapshot.deleteMany({ where: { ts: { lt: aggregateCutoff } } }),
-      prisma.dvolTick.deleteMany({}),
       durablePrisma.metricSnapshot.deleteMany({ where: { ts: { lt: cutoff } } }),
       durablePrisma.surfaceSnapshot.deleteMany({ where: { ts: { lt: cutoff } } }),
       durablePrisma.flowTrade.deleteMany({ where: { ts: { lt: flowTradeCutoff } } }),
@@ -1363,7 +1408,7 @@ async function pruneOldHistory(): Promise<void> {
       durablePrisma.dvolTick.deleteMany({ where: { ts: { lt: dvolCutoff } } }),
     ]);
     console.log(
-      `[persist] pruned durable ${RETENTION_DAYS}d: metrics=${durableMetrics.count} surface=${durableSurface.count} alerts=${durableAlerts.count} ticks=${durableTicks.count} · durable flow ${FLOW_TRADE_RETENTION_DAYS}d=${durableTrades.count} · durable dvol ${DVOL_RETENTION_DAYS}d=${durableDvol.count} · sqlite legacy cleared: metrics=${legacyMetrics.count} surface=${legacySurface.count} trades=${legacyTrades.count} alerts=${legacyAlerts.count} ticks=${legacyTicks.count} dvol=${legacyDvol.count} · aggregate ${FLOW_AGGREGATE_RETENTION_HOURS}h=${aggs.count}`,
+      `[persist] pruned durable ${RETENTION_DAYS}d: metrics=${durableMetrics.count} surface=${durableSurface.count} alerts=${durableAlerts.count} ticks=${durableTicks.count} · durable flow ${FLOW_TRADE_RETENTION_DAYS}d=${durableTrades.count} · durable dvol ${DVOL_RETENTION_DAYS}d=${durableDvol.count} · sqlite local ${LOCAL_HISTORY_MAX_HOURS}h: metrics=${legacyMetrics.count} surface=${legacySurface.count} trades=${legacyTrades.count} alerts=${legacyAlerts.count} ticks=${legacyTicks.count} dvol=${legacyDvol.count} signal=${legacySignals.count} · aggregate ${FLOW_AGGREGATE_RETENTION_HOURS}h=${aggs.count}`,
     );
     const dataDisk = await getDiskUsage(DATA_DIR);
     await runSqliteMaintenanceIfNeeded(dataDisk);

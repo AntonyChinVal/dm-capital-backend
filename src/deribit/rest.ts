@@ -215,6 +215,11 @@ export function getBookSummaryCacheStatus() {
   };
 }
 
+export function getBookSummaryFetchedAt(currency = 'BTC'): number | null {
+  const entry = bookSummaryCache.get(currency.toUpperCase());
+  return entry?.fetchedAt ?? null;
+}
+
 export function fetchIndexPrice(indexName = 'btc_usd'): Promise<IndexPrice> {
   return call<IndexPrice>('public/get_index_price', { index_name: indexName });
 }

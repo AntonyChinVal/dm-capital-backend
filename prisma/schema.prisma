@@ -118,3 +118,30 @@ model DurableOutbox {
   @@index([kind, createdAt])
   @@index([createdAt])
 }
+
+model SignalSnapshot {
+  schemaVersion  Int      @default(1)
+  ts             DateTime
+  currency       String   @default("BTC")
+  spot           Float?
+  dvol           Float?
+  skew7d         Float?
+  skew30d        Float?
+  skew90d        Float?
+  skew180d       Float?
+  gexNet         Float?
+  gexUnit        String   @default("usd_per_1usd_move")
+  gammaFlip      Float?
+  callWall       Float?
+  cascadeWall    Float?
+  dexNet         Float?
+  vexNet         Float?
+  flowDeltaNet   Float?
+  flowVegaNet    Float?
+  flowPremiumNet Float?
+  regimeLabel    String?
+  ivGridByDelta  String?
+
+  @@id([ts, currency])
+  @@index([currency, ts])
+}
