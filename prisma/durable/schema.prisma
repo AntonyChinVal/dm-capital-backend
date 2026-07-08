@@ -31,6 +31,7 @@ model MetricSnapshot {
   count       Int
   gexCovered  Int
 
+  @@unique([currency, expiration, ts])
   @@index([currency, expiration, ts])
   @@index([ts])
 }
@@ -42,6 +43,7 @@ model SurfaceSnapshot {
   headlineSkew  Float?
   termStructure Json
 
+  @@unique([currency, ts])
   @@index([currency, ts])
 }
 

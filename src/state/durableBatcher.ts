@@ -324,20 +324,37 @@ async function writeSignal(payload: SignalSnapshotPayload): Promise<void> {
 }
 
 async function writeMetric(payload: MetricSnapshotPayload): Promise<void> {
-  await durablePrisma.metricSnapshot.create({
-    data: {
-      ...payload,
-      ts: new Date(payload.ts),
+  const data = {
+    ...payload,
+    ts: new Date(payload.ts),
+  };
+  await durablePrisma.metricSnapshot.upsert({
+    where: {
+      currency_expiration_ts: {
+        currency: payload.currency,
+        expiration: payload.expiration,
+        ts: new Date(payload.ts),
+      },
     },
+    create: data,
+    update: data,
   });
 }
 
 async function writeSurface(payload: SurfaceSnapshotPayload): Promise<void> {
-  await durablePrisma.surfaceSnapshot.create({
-    data: {
-      ...payload,
-      ts: new Date(payload.ts),
+  const data = {
+    ...payload,
+    ts: new Date(payload.ts),
+  };
+  await durablePrisma.surfaceSnapshot.upsert({
+    where: {
+      currency_ts: {
+        currency: payload.currency,
+        ts: new Date(payload.ts),
+      },
     },
+    create: data,
+    update: data,
   });
 }
 
