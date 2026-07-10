@@ -177,13 +177,29 @@ export interface DominantGammaExpiry {
   hoursLeft: number;
 }
 
-const GAMMA_SHARE_DOMINANCE = 0.4;
+function envShare(name: string, fallback: number): number {
+  const raw = process.env[name];
+  const value = raw == null || raw === '' ? fallback : Number(raw);
+  if (!Number.isFinite(value)) return fallback;
+  return Math.min(1, Math.max(0, value));
+}
+
+/** Share to exit fallback and attribute gamma to an expiry (default 45%). */
+export const GAMMA_BRIDGE_ENTER_SHARE = envShare('GAMMA_BRIDGE_ENTER_SHARE', 0.45);
+/** Share to return to fallback copy (default 35%). */
+export const GAMMA_BRIDGE_EXIT_SHARE = envShare('GAMMA_BRIDGE_EXIT_SHARE', 0.35);
+
+/** @deprecated Use GAMMA_BRIDGE_ENTER_SHARE — kept for callers referencing the old 40% threshold. */
+export const GAMMA_SHARE_DOMINANCE = GAMMA_BRIDGE_ENTER_SHARE;
+
+type BridgeGammaMode = 'attributed' | 'fallback';
+const bridgeGammaHysteresis = new Map<string, BridgeGammaMode>();
 
 /**
  * Aggregate |gamma| by expiry across all strikes in [putWall, callWall].
- * Returns the expiry with the largest aggregated share when it clears 40%.
+ * Always returns the expiry with the largest aggregated share (no threshold).
  */
-export function dominantGammaExpiryInRange(
+export function largestGammaExpiryInRange(
   putWall: number,
   callWall: number,
   rows: GexExpiryInput[],
@@ -217,7 +233,7 @@ export function dominantGammaExpiryInRange(
       best = { expiration, ts, share };
     }
   }
-  if (!best || best.share < GAMMA_SHARE_DOMINANCE) return null;
+  if (!best) return null;
 
   return {
     expiration: best.expiration,
@@ -227,7 +243,61 @@ export function dominantGammaExpiryInRange(
   };
 }
 
-export { GAMMA_SHARE_DOMINANCE };
+export interface BridgeGammaRelease {
+  /** Set when hysteresis state is attributed (share cleared enter threshold). */
+  dominant: DominantGammaExpiry | null;
+  /** Largest share in range — always set when any gamma exists (fallback copy). */
+  largestInRange: DominantGammaExpiry | null;
+}
+
+/**
+ * Bridge banner release with enter/exit hysteresis on gamma share.
+ * Enter attributed mode when share ≥ GAMMA_BRIDGE_ENTER_SHARE (default 45%).
+ * Return to fallback when share < GAMMA_BRIDGE_EXIT_SHARE (default 35%).
+ * Between exit and enter, keep the current mode.
+ */
+export function resolveBridgeGammaRelease(
+  putWall: number,
+  callWall: number,
+  rows: GexExpiryInput[],
+  defaultSpot: number,
+  hysteresisKey: string,
+  nowMs = Date.now(),
+): BridgeGammaRelease {
+  const largest = largestGammaExpiryInRange(putWall, callWall, rows, defaultSpot, nowMs);
+  if (!largest) return { dominant: null, largestInRange: null };
+
+  const share = largest.sharePct / 100;
+  let mode = bridgeGammaHysteresis.get(hysteresisKey) ?? 'fallback';
+
+  if (mode === 'fallback' && share >= GAMMA_BRIDGE_ENTER_SHARE) {
+    mode = 'attributed';
+  } else if (mode === 'attributed' && share < GAMMA_BRIDGE_EXIT_SHARE) {
+    mode = 'fallback';
+  }
+
+  bridgeGammaHysteresis.set(hysteresisKey, mode);
+
+  return {
+    dominant: mode === 'attributed' ? largest : null,
+    largestInRange: largest,
+  };
+}
+
+/**
+ * @deprecated Use resolveBridgeGammaRelease — hard 40% threshold without hysteresis.
+ */
+export function dominantGammaExpiryInRange(
+  putWall: number,
+  callWall: number,
+  rows: GexExpiryInput[],
+  defaultSpot: number,
+  nowMs = Date.now(),
+): DominantGammaExpiry | null {
+  const largest = largestGammaExpiryInRange(putWall, callWall, rows, defaultSpot, nowMs);
+  if (!largest || largest.sharePct / 100 < GAMMA_BRIDGE_ENTER_SHARE) return null;
+  return largest;
+}
 
 /**
  * DEX per strike (delta is already signed by option type).

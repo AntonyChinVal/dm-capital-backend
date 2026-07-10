@@ -89,6 +89,8 @@ export function buildPanorama(inputs: SynthesisInputs): PanoramaTile[] {
 
 export interface BridgeReleaseContext {
   dominant: DominantGammaExpiry | null;
+  /** Largest expiry share in range — used for auditable fallback copy. */
+  largestInRange?: DominantGammaExpiry | null;
   nextOpex: { expiration: string; tag: string } | null;
 }
 
@@ -120,7 +122,7 @@ export function buildBridgeText(
   const putStr = '$' + Math.round(putWall).toLocaleString();
   const rangePart = `Active range ${putStr} – ${callStr}`;
 
-  const { dominant, nextOpex } = release;
+  const { dominant, largestInRange, nextOpex } = release;
   if (dominant) {
     const countdown = formatCountdown(dominant.hoursLeft);
     const pct = Math.round(dominant.sharePct);
@@ -135,6 +137,14 @@ export function buildBridgeText(
     return { text: `${rangePart}.`, critical: false };
   }
   const opexKind = nextOpex.tag === 'Q' ? 'quarterly OPEX' : 'monthly OPEX';
+  const largest = largestInRange;
+  if (largest) {
+    const pct = Math.round(largest.sharePct);
+    return {
+      text: `${rangePart}. Gamma repartido entre expiries (mayor: ${largest.expiration} ${pct}%) · próxima liberación grande: ${opexKind} ${nextOpex.expiration}`,
+      critical: false,
+    };
+  }
   return {
     text: `${rangePart}. Releases after the ${opexKind} on ${nextOpex.expiration}.`,
     critical: false,

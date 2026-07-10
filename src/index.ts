@@ -28,7 +28,7 @@ import { buildSurface } from './compute/ivSurface.js';
 import { buildSurfaceByDelta } from './compute/ivSurfaceDelta.js';
 import { atmIv } from './compute/atmIv.js';
 import { classifyExpiration } from './compute/classifyExpiration.js';
-import { dominantGammaExpiryInRange } from './compute/gex.js';
+import { resolveBridgeGammaRelease } from './compute/gex.js';
 import { expectedMove24hBands, expectedMoveBands } from './compute/expectedMove.js';
 import { buildPanorama, buildBridgeText } from './compute/interpret/synthesis.js';
 import { pickSkewTiles, pickHeadlineSkew, pickHeadlineSkew30d } from './compute/interpret/skewTiles.js';
@@ -45,7 +45,7 @@ import { classifyTrade, type DeribitTrade } from './compute/tradeFlow.js';
 import { flowAggregator, flowWindowMeta } from './state/aggregator.js';
 import { alertStream } from './state/alerts.js';
 import { getDurableStatus, startDurableBatcher } from './state/durableBatcher.js';
-import { readIndexHistory, readMetricHistory } from './state/historyReader.js';
+import { readIndexHistory, readMetricHistory, readSignalSnapshot } from './state/historyReader.js';
 import { getDvol, updateDvol } from './state/dvol.js';
 import { getGreeks, greeksCount, greeksWithGamma, updateGreeks } from './state/greeks.js';
 import { persistSignalSnapshot } from './state/signalSnapshot.js';
@@ -374,6 +374,33 @@ app.get('/api/health', async (_req: Request, res: Response) => {
   });
 });
 
+app.get('/api/snapshot/latest', async (req: Request, res: Response) => {
+  try {
+    const currency = typeof req.query.currency === 'string' ? req.query.currency.toUpperCase() : 'BTC';
+    const atRaw = typeof req.query.at === 'string' ? req.query.at : undefined;
+    const at = atRaw ? new Date(atRaw) : undefined;
+    if (atRaw && (!at || Number.isNaN(at.getTime()))) {
+      return res.status(400).json({ error: 'at must be a valid ISO timestamp' });
+    }
+
+    const { row, source } = await readSignalSnapshot(currency, at);
+    if (!row) {
+      return res.status(404).json({ error: 'No signal snapshot found', currency, at: atRaw ?? null });
+    }
+
+    res.json({
+      source,
+      row: {
+        ...row,
+        ts: row.ts.toISOString(),
+      },
+    });
+  } catch (err) {
+    console.error('[api] snapshot/latest failed', err);
+    res.status(500).json({ error: 'Failed to read signal snapshot' });
+  }
+});
+
 const VALID_WINDOWS = new Set([60, 240, 1440]); // 1h, 4h, 24h in minutes
 
 app.get('/api/history/metrics', async (req: Request, res: Response) => {
@@ -590,16 +617,17 @@ app.get('/api/synthesis', async (req: Request, res: Response) => {
         const localCall = bundle.local.resistance;
         const liquidBook = filterLiquidStrikes(allRows);
         const gexExpiryRows = toGexExpiryRows(liquidBook, nowMs);
-        const dominant =
+        const gammaRelease =
           localPut != null && localCall != null
-            ? dominantGammaExpiryInRange(
+            ? resolveBridgeGammaRelease(
                 localPut,
                 localCall,
                 gexExpiryRows,
                 indexPrice.index_price,
+                `bridge:${currency}`,
                 nowMs,
               )
-            : null;
+            : { dominant: null, largestInRange: null };
 
         const emDaily = (() => {
           const futureRows = liquidBook
@@ -637,7 +665,11 @@ app.get('/api/synthesis', async (req: Request, res: Response) => {
           em1sigmaDaily: emDaily?.sigma1 ?? null,
         });
 
-        const bridge = buildBridgeText(localCall, localPut, { dominant, nextOpex });
+        const bridge = buildBridgeText(localCall, localPut, {
+          dominant: gammaRelease.dominant,
+          largestInRange: gammaRelease.largestInRange,
+          nextOpex,
+        });
 
         return {
           currency,
